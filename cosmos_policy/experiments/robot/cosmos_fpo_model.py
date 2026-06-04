@@ -8,8 +8,16 @@ Provides:
       select_action()                action-chunked inference with buffer
       compute_cfm_loss_for_storage() sample (sigma, eps) + compute old loss
       compute_cfm_loss()             recompute loss at stored (sigma, eps)
-      encode_obs()                   return stored clean latent for Critic
-  - Critic: MLP V(s) head.
+      get_env_values()               return per-env V(s) from last chunk's value token
+
+Value estimation
+----------------
+No separate Critic or ValueHead.  V(s) is read directly from the value token
+(index 10) that Cosmos generates together with the action chunk, using the same
+extraction and unnormalization as run_robocasa_eval.py:
+
+    raw = mean( generated[:, :, 10, :, :].flatten() )   # (B,)
+    V(s) = clamp( (raw + 1) / 2, 0, 1 )                 # mapped to [0, 1]
 
 Design notes
 ------------
@@ -53,21 +61,25 @@ from einops import rearrange
 #        5=action, 6=future_proprio, 7=future_wrist, 8=future_left,
 #        9=future_right, 10=value
 ROBOCASA_NUM_COND_FRAMES = 5
-ROBOCASA_ACTION_LATENT_IDX = 5  # == num_cond_frames
+ROBOCASA_ACTION_LATENT_IDX  = 5   # == num_cond_frames
+ROBOCASA_VALUE_LATENT_IDX   = 10  # value token in the generated sequence
+# Future state tokens: future_proprio, future_wrist, future_left, future_right
+ROBOCASA_FUTURE_LATENT_INDICES = (6, 7, 8, 9)
+
+# Mapping from future prediction index → current-state index in the next chunk's
+# cond_latent_frames.  At the next chunk boundary, cond_latent[:, :, src, :, :]
+# is the actual ground-truth for the predicted future token at dst.
+FUTURE_TARGET_MAPPING = {6: 1, 7: 2, 8: 3, 9: 4}  # dst → src
 
 # VAE / tokenizer constants
 COSMOS_IMAGE_SIZE = 224
 COSMOS_TEMPORAL_COMPRESSION = 4  # 1 latent frame ≡ 4 raw frames
 
-# EDM sigma sampling parameters (log-normal, matching Cosmos training config)
-EDM_LN_SIGMA_MEAN = 0.0
-EDM_LN_SIGMA_STD = 1.2
-EDM_SIGMA_MIN = 0.002
-EDM_SIGMA_MAX = 80.0
+# Sigma is sampled via model.sde.sample_t() (HybridEDMSDE) — see constants below.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LoRA injection
+# Fine-tuning setup: LoRA or full DiT
 # ──────────────────────────────────────────────────────────────────────────────
 
 def apply_lora_to_cosmos(
@@ -126,65 +138,80 @@ def apply_lora_to_cosmos(
     return model
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Critic (V head)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class Critic(nn.Module):
+def unfreeze_dit_for_finetuning(model: nn.Module) -> nn.Module:
     """
-    V(s) head operating on flattened VAE conditional latent features.
+    Freeze everything except the DiT (model.net) for full parameter fine-tuning.
 
-    Input: (B, C, T_cond, H, W) clean latent of the current state.
-    Spatially pooled before the MLP to reduce dimensionality.
+    The VAE tokenizer (encoder/decoder) remains frozen — only the transformer
+    weights are updated, matching the scope of Cosmos-IL supervised training.
+
+    Args:
+        model: Full Cosmos policy model (has .net attribute = DiT).
+
+    Returns:
+        The model with model.net fully unfrozen and all other weights frozen.
     """
+    # Freeze everything first
+    for param in model.parameters():
+        param.requires_grad = False
 
-    def __init__(
-        self,
-        cond_channels: int = 16,
-        num_cond_frames: int = ROBOCASA_NUM_COND_FRAMES,
-        hidden_dim: int = 512,
-        pool_hw: int = 4,
-    ):
-        super().__init__()
-        self.spatial_pool = nn.AdaptiveAvgPool2d((pool_hw, pool_hw))
-        flat_dim = cond_channels * num_cond_frames * pool_hw * pool_hw
+    # Unfreeze the DiT in full
+    for param in model.net.parameters():
+        param.requires_grad = True
 
-        self.mlp = nn.Sequential(
-            nn.Linear(flat_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-
-    def forward(self, cond_latent: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            cond_latent: (B, C, T_cond, H, W) float32
-        Returns:
-            value: (B, 1)
-        """
-        B, C, T, H, W = cond_latent.shape
-        x = cond_latent.reshape(B * C * T, 1, H, W)
-        x = self.spatial_pool(x)          # (B*C*T, 1, pool_hw, pool_hw)
-        x = x.reshape(B, -1)              # (B, C*T*pool_hw*pool_hw)
-        return self.mlp(x)                # (B, 1)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Sigma sampling / EDM loss weight
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _sample_sigma(batch_size: int, device: torch.device) -> torch.Tensor:
-    log_sigma = (
-        torch.randn(batch_size, device=device) * EDM_LN_SIGMA_STD + EDM_LN_SIGMA_MEAN
+    n_trainable = sum(p.numel() for p in model.net.parameters())
+    n_total_model = sum(p.numel() for p in model.parameters())
+    print(
+        f"[Full DiT] trainable: {n_trainable:,} / {n_total_model:,} "
+        f"({100*n_trainable/n_total_model:.3f}%)"
     )
-    return log_sigma.exp().clamp(EDM_SIGMA_MIN, EDM_SIGMA_MAX)
+    return model
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EDM loss weight
+# ──────────────────────────────────────────────────────────────────────────────
+# Sigma is sampled via model.sde.sample_t() so that the distribution matches
+# supervised training exactly (HybridEDMSDE: 70% log-normal p_mean=1.386,
+# p_std=1.2  + 30% uniform [1.0, 85.0]).
 
 
 def _edm_loss_weight(sigma: torch.Tensor) -> torch.Tensor:
     sigma_data = 0.5
     return (sigma ** 2 + sigma_data ** 2) / (sigma * sigma_data) ** 2
+
+
+def _build_sigma_B_T(
+    B: int,
+    T: int,
+    dev,
+    sigma: torch.Tensor,
+    sigma_conditional: float,
+    prediction_indices: List[int],
+) -> torch.Tensor:
+    """Build per-frame sigma tensor used by model.denoise().
+
+    Conditional frames (0..ROBOCASA_NUM_COND_FRAMES-1) receive sigma_conditional;
+    prediction_indices receive the sampled sigma; all other frames remain zero.
+    """
+    sigma_B_T = torch.zeros(B, T, device=dev, dtype=sigma.dtype)
+    sigma_B_T[:, :ROBOCASA_NUM_COND_FRAMES] = sigma_conditional
+    for idx in prediction_indices:
+        sigma_B_T[:, idx] = sigma
+    return sigma_B_T
+
+
+def _latent_frame_to_scalar(latent_frame: torch.Tensor) -> torch.Tensor:
+    """Mean-pool a single latent frame and unnormalize from [-1,1] to [0,1].
+
+    Args:
+        latent_frame: (B, C, H, W) float32
+    Returns:
+        (B,) float32 in [0, 1]
+    """
+    B   = latent_frame.shape[0]
+    raw = latent_frame.float().reshape(B, -1).mean(dim=1)
+    return torch.clamp((raw + 1.0) / 2.0, 0.0, 1.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -323,13 +350,11 @@ class CosmosFPOPolicy:
     def __init__(
         self,
         model: nn.Module,
-        critic: Critic,
         dataset_stats: dict,
         cfg,
         n_cfm_samples: int = 16,
     ):
         self.model = model
-        self.critic = critic
         self.dataset_stats = dataset_stats
         self.cfg = cfg
         self.n_cfm_samples = n_cfm_samples
@@ -337,8 +362,9 @@ class CosmosFPOPolicy:
         self.n_open_loop = cfg.num_open_loop_steps
         self._action_buffers: Dict[int, deque] = {}
         # Per-env latents (CPU tensors, shape (1, 16, 11, H, W)), updated at chunk boundaries
-        self._env_cond: Dict[int, torch.Tensor] = {}   # orig_clean_latent_frames
-        self._env_x0:   Dict[int, torch.Tensor] = {}   # generated_latent (full sequence)
+        self._env_cond:  Dict[int, torch.Tensor] = {}   # orig_clean_latent_frames
+        self._env_x0:    Dict[int, torch.Tensor] = {}   # generated_latent (full sequence)
+        self._env_value: Dict[int, float] = {}           # V(s) from model's value token
 
     # ──────────────────────────────────────────
     # Inference
@@ -413,12 +439,17 @@ class CosmosFPOPolicy:
             if self.cfg.unnormalize_actions:
                 actions_raw = unnormalize_actions(actions_raw, self.dataset_stats)
 
+            # Extract V(s) from the model's value token (index 10, last frame).
+            value_latent = generated[:, :, ROBOCASA_VALUE_LATENT_IDX, :, :].float()
+            env_values   = _latent_frame_to_scalar(value_latent)  # (sub_B,) in [0,1]
+
             for k, env_i in enumerate(needs_chunk):
                 for s in range(self.n_open_loop):
                     self._action_buffers[env_i].append(actions_raw[k, s])
-                # Store per-env latents on CPU for Critic / CFM loss recomputation
-                self._env_cond[env_i] = orig_clean[k : k + 1].float().cpu()
-                self._env_x0[env_i]   = generated[k : k + 1].float().cpu()
+                # Store per-env latents on CPU for CFM loss recomputation
+                self._env_cond[env_i]  = orig_clean[k : k + 1].float().cpu()
+                self._env_x0[env_i]    = generated[k : k + 1].float().cpu()
+                self._env_value[env_i] = env_values[k].item()  # Python float
 
             x0_latent_out = generated.float()
             cond_latent_out = orig_clean.float()
@@ -434,11 +465,13 @@ class CosmosFPOPolicy:
             self._action_buffers.clear()
             self._env_cond.clear()
             self._env_x0.clear()
+            self._env_value.clear()
         else:
             for i in env_indices:
                 self._action_buffers.pop(i, None)
                 self._env_cond.pop(i, None)
                 self._env_x0.pop(i, None)
+                self._env_value.pop(i, None)
 
     def get_env_cond_latents(
         self, env_indices: List[int], device: str = "cuda"
@@ -465,13 +498,18 @@ class CosmosFPOPolicy:
         return torch.cat([self._env_x0[i] for i in env_indices], dim=0).to(device)
 
     # ──────────────────────────────────────────
-    # Critic
+    # Value access
     # ──────────────────────────────────────────
 
-    def get_value(self, cond_latent_frames: torch.Tensor) -> torch.Tensor:
-        """V(s): (B, 16, 11, H, W) → (B, 1).  Uses conditional frames only."""
-        cond = cond_latent_frames[:, :, :ROBOCASA_NUM_COND_FRAMES, :, :].float()
-        return self.critic(cond)
+    def get_env_values(self, env_indices: List[int]) -> Optional[np.ndarray]:
+        """Return V(s) for each env from the last chunk's value token.
+
+        Returns None if any env has not generated a chunk yet.
+        Shape: (len(env_indices),) float32  range [0, 1].
+        """
+        if not all(i in self._env_value for i in env_indices):
+            return None
+        return np.array([self._env_value[i] for i in env_indices], dtype=np.float32)
 
     # ──────────────────────────────────────────
     # Condition builder (no VAE re-encoding)
@@ -522,19 +560,16 @@ class CosmosFPOPolicy:
         inside model.denoise() via the condition mask.
         """
         B = cond_latent_frames.shape[0]
+        T = cond_latent_frames.shape[2]
 
-        # xt_full: use clean input, replace frame 5 with noisy action
-        xt_full = cond_latent_frames.clone()
+        xt_full  = cond_latent_frames.clone()
         sigma_hw = rearrange(sigma, "b -> b 1 1 1")
         xt_full[:, :, ROBOCASA_ACTION_LATENT_IDX, :, :] = x0_action + sigma_hw * eps
 
-        # Use per-frame sigma: small for conditional frames, sigma_sample for action
-        sigma_B_T = torch.zeros(B, cond_latent_frames.shape[2], device=sigma.device,
-                                dtype=sigma.dtype)
-        sigma_B_T[:, :ROBOCASA_NUM_COND_FRAMES] = self.model.config.sigma_conditional
-        sigma_B_T[:, ROBOCASA_ACTION_LATENT_IDX] = sigma
+        sigma_B_T = _build_sigma_B_T(B, T, sigma.device, sigma,
+                                     self.model.config.sigma_conditional,
+                                     [ROBOCASA_ACTION_LATENT_IDX])
 
-        # model.denoise() handles preconditioning + conditioning mask replacement
         denoised = self.model.denoise(xt_full, sigma_B_T, condition)
         x0_pred_action = denoised.x0[:, :, ROBOCASA_ACTION_LATENT_IDX, :, :]
 
@@ -567,7 +602,8 @@ class CosmosFPOPolicy:
         dev = x0_full_latent.device
 
         x0_action = x0_full_latent[:, :, ROBOCASA_ACTION_LATENT_IDX, :, :]
-        sigmas = _sample_sigma(B * N, dev).reshape(B, N)
+        # Use model.sde.sample_t() for the same HybridEDMSDE distribution as supervised training
+        sigmas = self.model.sde.sample_t(B * N).reshape(B, N)
         epsilons = torch.randn(B, N, *x0_action.shape[1:], device=dev)
 
         condition = self._build_condition(data_batch, cond_latent_frames)
@@ -615,3 +651,90 @@ class CosmosFPOPolicy:
             losses.append(loss_n)
 
         return torch.stack(losses, dim=1)  # (B, N)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Combined value + future prediction (shared sigma, single forward pass)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def compute_value_and_future_loss(
+        self,
+        data_batch: dict,
+        returns: torch.Tensor,             # (B, 1) or (B,)  GAE returns in [0, 1]
+        cond_latent_frames: torch.Tensor,  # (B, C, T, H, W) conditioning from rollout
+        future_cond_latent: torch.Tensor,  # (B, C, T, H, W) VAE-encoded actual future obs
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Single EDM forward pass for value (idx 10) and future state tokens (idx 6-9),
+        sharing ONE sigma per batch item — matching supervised training exactly.
+
+        Value token target format (Cosmos-IL style):
+          The scalar GAE return is renormalized [0,1] → [-1,1] and broadcast uniformly
+          across (C, H, W), identical to how Cosmos-IL injects value_function_return:
+            x0_value = ret_normalized.reshape(B,1,1,1).expand(B, C, H, W)
+          EDM reconstruction loss is computed at the latent level (same as Cosmos-IL).
+
+        Future token targets (FUTURE_TARGET_MAPPING):
+          idx 6-9 ← future_cond_latent[:, :, 1-4, :, :]  (actual future obs)
+
+        Returns:
+            v_pred:   (B,) float32 in [0, 1]  — scalar value from denoised token
+            aux_loss: scalar — EDM weighted MSE averaged over value + future tokens
+        """
+        B   = cond_latent_frames.shape[0]
+        T   = cond_latent_frames.shape[2]
+        C   = cond_latent_frames.shape[1]
+        H   = cond_latent_frames.shape[3]
+        W   = cond_latent_frames.shape[4]
+        dev = cond_latent_frames.device
+
+        future_cond_latent = future_cond_latent.to(dev)
+
+        # Renormalize returns [0,1] → [-1,1] to match Cosmos-IL injection scale,
+        # then broadcast scalar uniformly to fill (C, H, W) — same format as:
+        #   x0[b, :, value_idx, :, :] = scalar.reshape(-1,1,1,1).expand(-1, C, H, W)
+        ret_normalized = (returns.view(B) * 2.0 - 1.0).clamp(-1.0, 1.0)  # (B,)
+        x0_value = ret_normalized.view(B, 1, 1, 1).expand(B, C, H, W).float().contiguous()
+
+        # ONE sigma per batch item, shared across value + all future tokens.
+        sigma    = self.model.sde.sample_t(B).to(dev)   # (B,)
+        sigma_hw = rearrange(sigma, "b -> b 1 1 1")
+
+        # Build noisy input: start from clean conditioning, replace prediction tokens
+        xt_full = cond_latent_frames.clone()
+        xt_full[:, :, ROBOCASA_VALUE_LATENT_IDX, :, :] = (
+            x0_value + sigma_hw * torch.randn_like(x0_value)
+        )
+        for dst_idx, src_idx in FUTURE_TARGET_MAPPING.items():
+            x0_future = future_cond_latent[:, :, src_idx, :, :].float()
+            xt_full[:, :, dst_idx, :, :] = x0_future + sigma_hw * torch.randn_like(x0_future)
+
+        sigma_B_T = _build_sigma_B_T(
+            B, T, dev, sigma,
+            self.model.config.sigma_conditional,
+            [ROBOCASA_VALUE_LATENT_IDX] + list(FUTURE_TARGET_MAPPING.keys()),
+        )
+
+        condition = self._build_condition(data_batch, cond_latent_frames)
+        denoised  = self.model.denoise(xt_full, sigma_B_T, condition)
+        weight    = _edm_loss_weight(sigma)  # (B,)
+
+        # ── Value scalar prediction ─────────────────────────────────────────
+        x0_pred_value = denoised.x0[:, :, ROBOCASA_VALUE_LATENT_IDX, :, :]  # (B, C, H, W)
+        v_pred = _latent_frame_to_scalar(x0_pred_value)                      # (B,) [0,1]
+
+        # ── EDM reconstruction losses (value + future, averaged over 5 tokens) ──
+        total_loss = torch.zeros(B, device=dev)
+
+        # Value token: latent-level reconstruction against uniform broadcast target
+        mse_v = ((x0_pred_value - x0_value.to(x0_pred_value.dtype)) ** 2).mean(dim=[1, 2, 3])
+        total_loss = total_loss + weight * mse_v
+
+        # Future tokens: reconstruction against actual future observations
+        for dst_idx, src_idx in FUTURE_TARGET_MAPPING.items():
+            x0_pred_f   = denoised.x0[:, :, dst_idx, :, :]
+            x0_target_f = future_cond_latent[:, :, src_idx, :, :].float()
+            mse_f = ((x0_pred_f - x0_target_f.to(x0_pred_f.dtype)) ** 2).mean(dim=[1, 2, 3])
+            total_loss = total_loss + weight * mse_f
+
+        aux_loss = (total_loss / (1 + len(FUTURE_TARGET_MAPPING))).mean()
+        return v_pred, aux_loss

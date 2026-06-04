@@ -4,7 +4,7 @@ FPO++ online RL training of Cosmos Policy on RoboCasa (Phase 2).
 Structure mirrors manipulation_experiments/finetune_online_rl.py, adapted for:
   - Cosmos's EDM noise schedule (instead of pure flow matching)
   - RoboCasa multi-camera observations
-  - 2B-parameter DiT with LoRA (not full fine-tune)
+  - 2B-parameter DiT with LoRA (or full DiT) fine-tuning
   - Action-chunk execution (chunk=32, open-loop=16)
 
 Usage (inside Docker container):
@@ -16,13 +16,11 @@ Usage (inside Docker container):
         --lora_rank 8 \\
         --log_dir runs/fpo_TurnOffMicrowave
 
-Phase 3 extension point
------------------------
-Replace the scalar Critic with a flow-based value head (Value Flows approach):
-  1. Remove Critic from cosmos_fpo_model.py.
-  2. Add a value latent decoder that reads the value token (index 10) from the
-     generated full latent and maps it to a scalar via a learned linear head.
-  3. This lets the value prediction benefit from the world model's context.
+Value estimation
+----------------
+No separate Critic or ValueHead.  V(s) is read directly from the value token
+(index 10) that the Cosmos DiT generates together with the action chunk, using
+the same extraction + unnormalization as run_robocasa_eval.py.
 """
 
 from __future__ import annotations
@@ -31,14 +29,17 @@ import argparse
 import os
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+import wandb
+from diffusers.optimization import get_scheduler
+
+from cosmos_policy.experiments.robot.robocasa.fpo_buffer import RolloutBuffer
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -52,12 +53,13 @@ class TrainConfig:
     img_res: int = 224
     obj_instance_split: str = "B"
 
-    # ── Model / LoRA ──────────────────────────────────────────────────────
+    # ── Model / Fine-tuning ───────────────────────────────────────────────
     ckpt_path: str = "nvidia/Cosmos-Policy-RoboCasa-Predict2-2B"
     dataset_stats_path: str = "nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_dataset_statistics.json"
     t5_embeddings_path: str = "nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_t5_embeddings.pkl"
     config_file: str = "cosmos_policy/config/config.py"
     cosmos_config: str = "cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference"
+    finetune_mode: str = "lora"      # "lora" | "full_dit"
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0
@@ -65,11 +67,11 @@ class TrainConfig:
 
     # ── Action chunking ───────────────────────────────────────────────────
     chunk_size: int = 32
-    n_open_loop: int = 16          # actions executed per chunk before re-query
+    n_open_loop: int = 16
 
     # ── Rollout ───────────────────────────────────────────────────────────
-    steps_per_iter: int = 96       # environment steps collected per iteration
-    n_cfm_samples: int = 16        # (σ, ε) samples per step for FPO ratio
+    steps_per_iter: int = 96
+    n_cfm_samples: int = 16
 
     # ── GAE ───────────────────────────────────────────────────────────────
     gamma: float = 0.99
@@ -78,33 +80,44 @@ class TrainConfig:
     # ── PPO / FPO ─────────────────────────────────────────────────────────
     update_epochs: int = 4
     num_mini_batches: int = 4
-    clip_coef: float = 0.01        # PPO clip ε
+    clip_coef: float = 0.01
     vf_coef: float = 0.5
+    aux_coef: float = 1.0
     max_grad_norm: float = 1.0
-    trust_region_mode: str = "ppo" # "ppo" | "spo" | "aspo"
+    trust_region_mode: str = "ppo"   # "ppo" | "spo" | "aspo"
 
     # ── Optimiser ────────────────────────────────────────────────────────
     lr_lora: float = 1e-5
-    lr_critic: float = 1e-4
     adam_eps: float = 1e-5
     weight_decay: float = 0.0
+
+    # ── LR scheduler ─────────────────────────────────────────────────────
+    lr_scheduler_name: str = "constant"
+    lr_scheduler_warmup_steps: int = 5
 
     # ── Training schedule ─────────────────────────────────────────────────
     total_timesteps: int = 1_000_000
     seed: int = 42
 
+    # ── Eval ─────────────────────────────────────────────────────────────
+    eval_rollout_freq: int = 10
+    eval_num_episodes: int = 10
+
+    # ── W&B ───────────────────────────────────────────────────────────────
+    wandb_enable: bool = True
+    wandb_project: str = "fpo-cosmos-robocasa"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+
     # ── Logging ───────────────────────────────────────────────────────────
     log_dir: str = "runs/fpo_robocasa"
-    save_interval: int = 10        # save checkpoint every N iterations
+    save_interval: int = 10
     log_interval: int = 1
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Inline eval config (passed to CosmosFPOPolicy / data_batch builder)
-# ──────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class _EvalCfg:
+    """Thin config forwarded to CosmosFPOPolicy / data_batch builder."""
     suite: str = "robocasa"
     config: str = ""
     ckpt_path: str = ""
@@ -135,36 +148,26 @@ class _EvalCfg:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def calculate_advantage(
-    values: np.ndarray,      # (T, B)
-    rewards: np.ndarray,     # (T, B)
-    dones: np.ndarray,       # (T, B)
-    last_value: np.ndarray,  # (B,)
+    values: np.ndarray,
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    last_value: np.ndarray,
     gamma: float,
     gae_lambda: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Generalised Advantage Estimation.
-
-    Returns:
-        advantages: (T, B)
-        returns:    (T, B)
-    """
+    """Generalised Advantage Estimation.  Returns (advantages, returns), both (T, B)."""
     T, B = rewards.shape
     advantages = np.zeros_like(rewards)
     last_gae = np.zeros(B, dtype=np.float32)
 
     for t in reversed(range(T)):
-        if t == T - 1:
-            next_value = last_value
-        else:
-            next_value = values[t + 1]
-        next_non_terminal = 1.0 - dones[t].astype(np.float32)
-        delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
-        last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+        next_value = last_value if t == T - 1 else values[t + 1]
+        non_terminal = 1.0 - dones[t].astype(np.float32)
+        delta = rewards[t] + gamma * next_value * non_terminal - values[t]
+        last_gae = delta + gamma * gae_lambda * non_terminal * last_gae
         advantages[t] = last_gae
 
-    returns = advantages + values
-    return advantages, returns
+    return advantages, advantages + values
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,28 +175,21 @@ def calculate_advantage(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def fpo_surrogate_loss(
-    old_cfm_loss: torch.Tensor,   # (B, N)
-    new_cfm_loss: torch.Tensor,   # (B, N)
-    advantages: torch.Tensor,     # (B, 1)
+    old_cfm_loss: torch.Tensor,
+    new_cfm_loss: torch.Tensor,
+    advantages: torch.Tensor,
     clip_coef: float,
     trust_region_mode: str = "ppo",
 ) -> torch.Tensor:
-    """
-    FPO++ policy gradient loss.
-
-    ratio_i = exp(L_old_i - L_new_i)   per CFM sample i
-    Then the N ratios are averaged for the PPO / SPO objective.
-    """
-    log_ratio = old_cfm_loss - new_cfm_loss          # (B, N)
-    ratio = torch.exp(log_ratio)                      # (B, N)
-
-    # Broadcast advantages: (B, 1) → (B, N)
-    adv = advantages.expand_as(ratio)
+    """FPO++ policy gradient loss.  ratio_i = exp(L_old_i − L_new_i) per sample i."""
+    ratio = torch.exp(old_cfm_loss - new_cfm_loss)   # (B, N)
+    adv   = advantages.expand_as(ratio)               # broadcast (B,1)→(B,N)
 
     if trust_region_mode == "ppo":
-        s1 = -adv * ratio
-        s2 = -adv * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef)
-        loss = torch.max(s1, s2).mean()
+        loss = torch.max(
+            -adv * ratio,
+            -adv * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef),
+        ).mean()
     elif trust_region_mode == "spo":
         loss = -(adv * ratio - adv.abs() / (2.0 * clip_coef) * (ratio - 1.0) ** 2).mean()
     elif trust_region_mode == "aspo":
@@ -202,165 +198,76 @@ def fpo_surrogate_loss(
         spo = -(adv * ratio - adv.abs() / (2.0 * clip_coef) * (ratio - 1.0) ** 2)
         loss = torch.where(adv > 0, ppo, spo).mean()
     else:
-        raise ValueError(f"Unknown trust_region_mode: {trust_region_mode}")
+        raise ValueError(f"Unknown trust_region_mode: {trust_region_mode!r}")
 
     return loss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Rollout storage
+# Evaluation
 # ──────────────────────────────────────────────────────────────────────────────
 
-class RolloutBuffer:
-    """Stores one iteration's worth of transitions for FPO++ update."""
+@torch.no_grad()
+def run_eval(policy, envs, num_episodes: int) -> float:
+    """Run evaluation episodes on the shared env and return success rate."""
+    was_training = policy.model.training
+    policy.model.eval()
+    policy.reset_buffers()
 
-    def __init__(self, steps: int, num_envs: int, n_cfm: int,
-                 latent_c: int, latent_h: int, latent_w: int, latent_t: int):
-        self.steps = steps
-        self.B = num_envs
-        self.N = n_cfm
-        C, H, W, T = latent_c, latent_h, latent_w, latent_t
+    env_list = list(range(envs.num_envs))
+    obs_list, _ = envs.reset()
+    success_count = episode_count = 0
 
-        # RL scalars
-        self.rewards   = np.zeros((steps, num_envs), dtype=np.float32)
-        self.dones     = np.zeros((steps, num_envs), dtype=bool)
-        self.values    = np.zeros((steps, num_envs), dtype=np.float32)
+    while episode_count < num_episodes:
+        actions_np, _, _, _ = policy.select_action(obs_list, env_indices=env_list)
+        obs_list, _, dones, truncateds, infos = envs.step(actions_np)
 
-        # FPO++ tensors
-        self.old_cfm_loss = np.zeros((steps, num_envs, n_cfm), dtype=np.float32)
-        self.sigmas       = np.zeros((steps, num_envs, n_cfm), dtype=np.float32)
-        self.epsilons     = np.zeros((steps, num_envs, n_cfm, C, H, W), dtype=np.float32)
-        self.x0_latent    = np.zeros((steps, num_envs, C, T, H, W), dtype=np.float32)
+        for i in np.where(dones | truncateds)[0]:
+            if episode_count < num_episodes:
+                success_count += int(infos[i].get("success", False))
+                episode_count += 1
 
-        # Conditional latent (full 11-frame clean latent from rollout) — per step
-        self.cond_latent = np.zeros((steps, num_envs, C, T, H, W), dtype=np.float32)
+        done_indices = np.where(dones | truncateds)[0]
+        if len(done_indices) > 0:
+            policy.reset_buffers(env_indices=done_indices.tolist())
 
-        # data_batch is stored as a list (one per chunk boundary, not per step)
-        self.data_batches: Dict[int, dict] = {}
-
-        self.ptr = 0
-
-    def add(
-        self,
-        step_idx: int,
-        rewards: np.ndarray,
-        dones: np.ndarray,
-        values: np.ndarray,
-        old_cfm_loss: Optional[np.ndarray],
-        sigmas: Optional[np.ndarray],
-        epsilons: Optional[np.ndarray],
-        x0_latent: Optional[torch.Tensor],
-        cond_latent: Optional[torch.Tensor],
-        data_batch: Optional[dict],
-    ):
-        self.rewards[step_idx] = rewards
-        self.dones[step_idx] = dones
-        self.values[step_idx] = values
-
-        if old_cfm_loss is not None:
-            self.old_cfm_loss[step_idx] = old_cfm_loss
-            self.sigmas[step_idx] = sigmas
-            self.epsilons[step_idx] = epsilons
-            self.x0_latent[step_idx] = x0_latent.cpu().numpy()
-            self.cond_latent[step_idx] = cond_latent.cpu().numpy()  # full (B, C, T, H, W)
-            self.data_batches[step_idx] = data_batch
-
-    def get_mini_batches(self, num_mini_batches: int, advantages: np.ndarray, returns: np.ndarray):
-        """Yield (advantages, returns, old_cfm_loss, sigmas, epsilons, x0_latent, cond_latent, data_batch)."""
-        # Collect steps that have CFM data (chunk boundaries)
-        chunk_steps = sorted(self.data_batches.keys())
-        if not chunk_steps:
-            return
-
-        indices = np.random.permutation(len(chunk_steps))
-        mb_size = max(1, len(indices) // num_mini_batches)
-
-        for start in range(0, len(indices), mb_size):
-            batch_steps = [chunk_steps[i] for i in indices[start: start + mb_size]]
-
-            # Concatenate across (time_steps × envs) in this mini-batch.
-            # advantages[s] shape: (num_envs,) → reshape to (num_envs, 1)
-            adv_mb    = torch.tensor(
-                np.concatenate([advantages[s].reshape(-1, 1) for s in batch_steps], axis=0),
-                dtype=torch.float32,
-            )  # (mb*B, 1)
-
-            ret_mb    = torch.tensor(
-                np.concatenate([returns[s].reshape(-1, 1) for s in batch_steps], axis=0),
-                dtype=torch.float32,
-            )  # (mb*B, 1)
-
-            old_loss  = torch.tensor(
-                np.concatenate([self.old_cfm_loss[s] for s in batch_steps], axis=0),
-                dtype=torch.float32,
-            )  # (mb*B, N)
-
-            sigmas_mb = torch.tensor(
-                np.concatenate([self.sigmas[s] for s in batch_steps], axis=0),
-                dtype=torch.float32,
-            )  # (mb*B, N)
-
-            eps_mb    = torch.tensor(
-                np.concatenate([self.epsilons[s] for s in batch_steps], axis=0),
-                dtype=torch.float32,
-            )  # (mb*B, N, C, H, W)
-
-            x0_mb     = torch.tensor(
-                np.concatenate([self.x0_latent[s] for s in batch_steps], axis=0),
-                dtype=torch.float32,
-            )  # (mb*B, C, T, H, W)
-
-            cond_mb   = torch.tensor(
-                np.concatenate([self.cond_latent[s] for s in batch_steps], axis=0),
-                dtype=torch.float32,
-            )  # (mb*B, C, T=11, H, W)
-
-            # data_batch: merge first step's data_batch (text embeddings are constant)
-            db_mb = self.data_batches[batch_steps[0]]
-
-            yield adv_mb, ret_mb, old_loss, sigmas_mb, eps_mb, x0_mb, cond_mb, db_mb
+    if was_training:
+        policy.model.train()
+    return success_count / max(1, episode_count)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Checkpoint save / load
 # ──────────────────────────────────────────────────────────────────────────────
 
-def save_checkpoint(path: str, model, critic, optimizer, iteration: int):
+def save_checkpoint(path: str, model, optimizer, iteration: int) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    state = {
+    torch.save({
         "iteration": iteration,
-        "lora_state_dict": {k: v for k, v in model.net.named_parameters() if v.requires_grad},
-        "critic_state_dict": critic.state_dict(),
+        "trainable_state_dict": {k: v for k, v in model.net.named_parameters()
+                                 if v.requires_grad},
         "optimizer_state_dict": optimizer.state_dict(),
-    }
-    torch.save(state, path)
+    }, path)
     print(f"  Saved checkpoint: {path}")
 
 
-def load_checkpoint(path: str, model, critic, optimizer):
+def load_checkpoint(path: str, model, optimizer) -> int:
     ckpt = torch.load(path, weights_only=False)
-    # Load LoRA params
+    # Support legacy "lora_state_dict" key from earlier runs
+    key = "trainable_state_dict" if "trainable_state_dict" in ckpt else "lora_state_dict"
     for name, param in model.net.named_parameters():
-        if name in ckpt["lora_state_dict"]:
-            param.data.copy_(ckpt["lora_state_dict"][name])
-    critic.load_state_dict(ckpt["critic_state_dict"])
+        if name in ckpt[key]:
+            param.data.copy_(ckpt[key][name])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     return ckpt["iteration"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main training loop
+# Training sub-functions (extracted from train())
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train(cfg: TrainConfig):
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-
-    os.makedirs(cfg.log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=cfg.log_dir)
-
-    # ── 1. Build eval config ──────────────────────────────────────────────
-    eval_cfg = _EvalCfg(
+def _build_eval_cfg(cfg: TrainConfig) -> _EvalCfg:
+    return _EvalCfg(
         config=cfg.cosmos_config,
         ckpt_path=cfg.ckpt_path,
         config_file=cfg.config_file,
@@ -370,52 +277,65 @@ def train(cfg: TrainConfig):
         num_open_loop_steps=cfg.n_open_loop,
     )
 
-    # ── 2. Load model ─────────────────────────────────────────────────────
-    print("[init] Loading Cosmos Policy …")
+
+def _setup_model_and_policy(cfg: TrainConfig, eval_cfg: _EvalCfg):
+    """Load Cosmos model, apply fine-tuning strategy, wrap in CosmosFPOPolicy."""
     from cosmos_policy.experiments.robot.cosmos_utils import (
         get_model, load_dataset_stats, init_t5_text_embeddings_cache,
     )
     from cosmos_policy.experiments.robot.cosmos_fpo_model import (
-        apply_lora_to_cosmos, CosmosFPOPolicy, Critic,
+        apply_lora_to_cosmos, unfreeze_dit_for_finetuning, CosmosFPOPolicy,
     )
 
+    print("[init] Loading Cosmos Policy …")
     init_t5_text_embeddings_cache(cfg.t5_embeddings_path)
     dataset_stats = load_dataset_stats(cfg.dataset_stats_path)
     model, _ = get_model(eval_cfg)
 
-    # ── 3. Apply LoRA ─────────────────────────────────────────────────────
-    print("[init] Applying LoRA …")
-    model = apply_lora_to_cosmos(
-        model,
-        lora_rank=cfg.lora_rank,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout,
-        target_modules=cfg.lora_targets.split(","),
-    )
+    if cfg.finetune_mode == "lora":
+        print("[init] Applying LoRA …")
+        model = apply_lora_to_cosmos(
+            model,
+            lora_rank=cfg.lora_rank,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            target_modules=cfg.lora_targets.split(","),
+        )
+    elif cfg.finetune_mode == "full_dit":
+        print("[init] Unfreezing full DiT (VAE frozen) …")
+        model = unfreeze_dit_for_finetuning(model)
+    else:
+        raise ValueError(f"Unknown finetune_mode: {cfg.finetune_mode!r}")
 
-    # ── 4. Build Critic ───────────────────────────────────────────────────
-    critic = Critic().cuda()
-
-    # ── 5. Build policy wrapper ───────────────────────────────────────────
-    policy = CosmosFPOPolicy(model, critic, dataset_stats, eval_cfg,
+    policy = CosmosFPOPolicy(model, dataset_stats, eval_cfg,
                              n_cfm_samples=cfg.n_cfm_samples)
+    return model, policy
 
-    # ── 6. Optimiser (LoRA params + Critic) ───────────────────────────────
-    lora_params  = [p for p in model.net.parameters() if p.requires_grad]
-    critic_params = list(critic.parameters())
+
+def _setup_optimizer_and_scheduler(cfg: TrainConfig, model, num_iterations: int):
+    """Create AdamW and diffusers LR scheduler for trainable DiT params."""
+    trainable_params = [p for p in model.net.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
-        [{"params": lora_params,   "lr": cfg.lr_lora},
-         {"params": critic_params, "lr": cfg.lr_critic}],
+        trainable_params,
+        lr=cfg.lr_lora,
         eps=cfg.adam_eps,
         weight_decay=cfg.weight_decay,
     )
+    lr_scheduler = get_scheduler(
+        name=cfg.lr_scheduler_name,
+        optimizer=optimizer,
+        num_warmup_steps=cfg.lr_scheduler_warmup_steps,
+        num_training_steps=num_iterations,
+    )
+    return trainable_params, optimizer, lr_scheduler
 
-    # ── 7. Vectorised environment ─────────────────────────────────────────
-    print(f"[init] Starting {cfg.num_envs} RoboCasa environments …")
+
+def _setup_envs(cfg: TrainConfig):
     from cosmos_policy.experiments.robot.robocasa.robocasa_gym_wrapper import (
         VectorizedRoboCasaEnv,
     )
-    envs = VectorizedRoboCasaEnv(
+    print(f"[init] Starting {cfg.num_envs} RoboCasa environments …")
+    return VectorizedRoboCasaEnv(
         task_name=cfg.task_name,
         num_envs=cfg.num_envs,
         base_seed=cfg.seed,
@@ -423,236 +343,292 @@ def train(cfg: TrainConfig):
         obj_instance_split=cfg.obj_instance_split,
     )
 
-    # ── 8. Training loop ──────────────────────────────────────────────────
-    # Latent shape constants (RoboCasa: C=16, T=11, H=28, W=28)
-    LAT_C, LAT_T, LAT_H, LAT_W = 16, 11, 28, 28
 
-    buf = RolloutBuffer(
+def _create_buffer(cfg: TrainConfig) -> RolloutBuffer:
+    return RolloutBuffer(
         steps=cfg.steps_per_iter,
         num_envs=cfg.num_envs,
         n_cfm=cfg.n_cfm_samples,
-        latent_c=LAT_C, latent_h=LAT_H, latent_w=LAT_W, latent_t=LAT_T,
+        latent_c=16, latent_h=28, latent_w=28, latent_t=11,
     )
+
+
+def _collect_rollout(
+    cfg: TrainConfig,
+    policy,
+    envs,
+    buf: RolloutBuffer,
+    obs_list: list,
+    total_steps: int,
+    success_buffer: deque,
+    ep_rew_buffer: deque,
+    ep_len_buffer: deque,
+    cur_ep_rew: np.ndarray,
+    cur_ep_len: np.ndarray,
+) -> Tuple[list, int]:
+    """Collect cfg.steps_per_iter environment steps into buf.
+
+    Returns updated (obs_list, total_steps).
+    """
+    policy.model.eval()
+    env_list = list(range(cfg.num_envs))
+
+    last_data_batch: Optional[dict]       = None
+    last_old_loss:   Optional[np.ndarray] = None
+    last_sigmas:     Optional[np.ndarray] = None
+    last_epsilons:   Optional[np.ndarray] = None
+
+    for step in range(cfg.steps_per_iter):
+        actions_np, x0_new, cond_latent_new, data_batch_new = policy.select_action(
+            obs_list, env_indices=env_list
+        )
+
+        full_chunk = x0_new is not None and x0_new.shape[0] == cfg.num_envs
+        if full_chunk:
+            old_loss, sigmas, epsilons = policy.compute_cfm_loss_for_storage(
+                data_batch_new, x0_new, cond_latent_new
+            )
+            last_data_batch = data_batch_new
+            last_old_loss   = old_loss.numpy()
+            last_sigmas     = sigmas.numpy()
+            last_epsilons   = epsilons.numpy()
+
+            # Retroactively store actual future obs for the previous chunk.
+            prev_step = step - cfg.n_open_loop
+            if prev_step >= 0 and prev_step in buf.data_batches:
+                if not buf.dones[prev_step:step].any():
+                    buf.set_future_cond(prev_step, cond_latent_new.cpu().numpy())
+
+        v = policy.get_env_values(env_list) or np.zeros(cfg.num_envs, dtype=np.float32)
+
+        obs_list, rewards, dones, truncateds, infos = envs.step(actions_np)
+
+        reset_envs = np.where(dones | truncateds)[0]
+        if len(reset_envs) > 0:
+            policy.reset_buffers(env_indices=reset_envs.tolist())
+            for i in reset_envs:
+                success_buffer.append(float(infos[i].get("success", False)))
+                ep_rew_buffer.append(cur_ep_rew[i])
+                ep_len_buffer.append(cur_ep_len[i])
+                cur_ep_rew[i] = 0.0
+                cur_ep_len[i] = 0.0
+
+        cur_ep_rew += rewards
+        cur_ep_len += 1.0
+        total_steps += cfg.num_envs
+
+        buf_x0   = policy.get_env_x0_latents(env_list, device="cpu") if full_chunk else None
+        buf_cond = policy.get_env_cond_latents(env_list, device="cpu") if full_chunk else None
+        buf.add(
+            step_idx=step,
+            rewards=rewards,
+            dones=dones | truncateds,
+            values=v,
+            old_cfm_loss=last_old_loss if full_chunk else None,
+            sigmas=last_sigmas        if full_chunk else None,
+            epsilons=last_epsilons    if full_chunk else None,
+            x0_latent=buf_x0,
+            cond_latent=buf_cond,
+            data_batch=last_data_batch if full_chunk else None,
+        )
+
+    return obs_list, total_steps
+
+
+def _compute_normalized_gae(cfg: TrainConfig, policy, buf: RolloutBuffer):
+    """Bootstrap V(s_T), run GAE, normalise advantages globally."""
+    last_v = policy.get_env_values(list(range(cfg.num_envs)))
+    if last_v is None:
+        last_v = np.zeros(cfg.num_envs, dtype=np.float32)
+
+    advantages, returns = calculate_advantage(
+        buf.values, buf.rewards, buf.dones, last_v,
+        gamma=cfg.gamma, gae_lambda=cfg.gae_lambda,
+    )
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    return advantages, returns
+
+
+def _fpo_update(
+    cfg: TrainConfig,
+    policy,
+    optimizer,
+    buf: RolloutBuffer,
+    advantages: np.ndarray,
+    returns: np.ndarray,
+    trainable_params: list,
+) -> Dict[str, float]:
+    """Run FPO++ update epochs.  Returns dict of mean losses."""
+    policy.model.train()
+    total = {"pg": 0.0, "vf": 0.0, "aux": 0.0, "ratio": 0.0}
+    n_updates = 0
+
+    for _ in range(cfg.update_epochs):
+        for (adv_mb, ret_mb, old_loss_mb, sigmas_mb, eps_mb,
+             x0_mb, cond_mb, future_cond_mb, db_mb) in buf.get_mini_batches(
+                cfg.num_mini_batches, advantages, returns):
+
+            adv_mb         = adv_mb.cuda()
+            ret_mb         = ret_mb.cuda()
+            old_loss_mb    = old_loss_mb.cuda()
+            sigmas_mb      = sigmas_mb.cuda()
+            eps_mb         = eps_mb.cuda()
+            x0_mb          = x0_mb.cuda()
+            cond_mb        = cond_mb.cuda()
+            future_cond_mb = future_cond_mb.cuda()
+
+            new_cfm_loss = policy.compute_cfm_loss(
+                db_mb, x0_mb.detach(), cond_mb, sigmas_mb, eps_mb
+            )
+            pg_loss = fpo_surrogate_loss(
+                old_cfm_loss=old_loss_mb,
+                new_cfm_loss=new_cfm_loss,
+                advantages=adv_mb,
+                clip_coef=cfg.clip_coef,
+                trust_region_mode=cfg.trust_region_mode,
+            )
+
+            v_pred, aux_loss = policy.compute_value_and_future_loss(
+                db_mb, ret_mb, cond_mb, future_cond_mb
+            )
+            vf_loss = ((v_pred - ret_mb.squeeze(-1)) ** 2).mean()
+
+            loss = pg_loss + cfg.vf_coef * vf_loss + cfg.aux_coef * aux_loss
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
+            optimizer.step()
+
+            with torch.no_grad():
+                total["ratio"] += torch.exp(old_loss_mb - new_cfm_loss).mean().item()
+            total["pg"]  += pg_loss.item()
+            total["vf"]  += vf_loss.item()
+            total["aux"] += aux_loss.item()
+            n_updates += 1
+
+    if n_updates > 0:
+        for k in total:
+            total[k] /= n_updates
+    return total
+
+
+def _log_iteration(
+    cfg: TrainConfig,
+    iteration: int,
+    num_iterations: int,
+    losses: Dict[str, float],
+    optimizer,
+    fps: float,
+    iter_time: float,
+    total_steps: int,
+    success_buffer: deque,
+    ep_rew_buffer: deque,
+    ep_len_buffer: deque,
+) -> None:
+    log_dict = {
+        "losses/policy":  losses["pg"],
+        "losses/value":   losses["vf"],
+        "losses/aux":     losses["aux"],
+        "fpo/ratio":      losses["ratio"],
+        "train/lr":       optimizer.param_groups[0]["lr"],
+        "perf/fps":       fps,
+        "perf/iter_time": iter_time,
+    }
+    if success_buffer:
+        log_dict["train/success_rate"]   = float(np.mean(success_buffer))
+        log_dict["train/mean_ep_reward"] = float(np.mean(ep_rew_buffer))
+        log_dict["train/mean_ep_length"] = float(np.mean(ep_len_buffer))
+
+    if cfg.wandb_enable:
+        wandb.log(log_dict, step=total_steps)
+
+    succ_str = f"succ={np.mean(success_buffer):.3f}" if success_buffer else "succ=n/a"
+    print(
+        f"Iter {iteration:4d}/{num_iterations}  steps={total_steps:,}  fps={fps:5.0f}  "
+        f"pg={losses['pg']:.4f}  vf={losses['vf']:.4f}  aux={losses['aux']:.4f}  "
+        f"ratio={losses['ratio']:.4f}  {succ_str}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def train(cfg: TrainConfig) -> None:
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    os.makedirs(cfg.log_dir, exist_ok=True)
+
+    if cfg.wandb_enable:
+        run_name = cfg.wandb_run_name or f"{cfg.task_name}_lora{cfg.lora_rank}"
+        wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity or None,
+                   name=run_name, config=vars(cfg), dir=cfg.log_dir)
+        print(f"[wandb] Run: {wandb.run.name}  url: {wandb.run.url}")
+
+    eval_cfg = _build_eval_cfg(cfg)
+    model, policy = _setup_model_and_policy(cfg, eval_cfg)
+
+    num_iterations = cfg.total_timesteps // (cfg.steps_per_iter * cfg.num_envs)
+    trainable_params, optimizer, lr_scheduler = _setup_optimizer_and_scheduler(
+        cfg, model, num_iterations
+    )
+    envs = _setup_envs(cfg)
+    buf  = _create_buffer(cfg)
 
     obs_list, _ = envs.reset()
     policy.reset_buffers()
-
     total_steps = 0
-    iteration = 0
-    num_iterations = cfg.total_timesteps // (cfg.steps_per_iter * cfg.num_envs)
-
     success_buffer = deque(maxlen=100)
-    ep_len_buffer  = deque(maxlen=100)
     ep_rew_buffer  = deque(maxlen=100)
-
-    cur_ep_len = np.zeros(cfg.num_envs, dtype=np.float32)
-    cur_ep_rew = np.zeros(cfg.num_envs, dtype=np.float32)
+    ep_len_buffer  = deque(maxlen=100)
+    cur_ep_rew     = np.zeros(cfg.num_envs, dtype=np.float32)
+    cur_ep_len     = np.zeros(cfg.num_envs, dtype=np.float32)
 
     print(f"[train] Starting {num_iterations} iterations × "
           f"{cfg.steps_per_iter} steps × {cfg.num_envs} envs")
 
     for iteration in range(1, num_iterations + 1):
-        t_iter_start = time.perf_counter()
+        t_start = time.perf_counter()
 
-        # ── 8a. Rollout collection ────────────────────────────────────────
-        model.eval()
-        critic.eval()
-        # No-grad is handled inside select_action / compute_cfm_loss_for_storage
-
-        # Keep track of last full-chunk CFM data (refreshed at full-env chunk boundaries)
-        last_data_batch:  Optional[dict]       = None
-        last_old_loss:    Optional[np.ndarray] = None
-        last_sigmas:      Optional[np.ndarray] = None
-        last_epsilons:    Optional[np.ndarray] = None
-
-        env_list = list(range(cfg.num_envs))
-
-        for step in range(cfg.steps_per_iter):
-            # Select action (refills buffer when empty)
-            # Returns: (actions, x0_latent, cond_latent_frames, data_batch)
-            # x0_latent / cond_latent_frames are None when no env needed a new chunk.
-            actions_np, x0_new, cond_latent_new, data_batch_new = policy.select_action(
-                obs_list, env_indices=env_list
-            )
-
-            # Recompute CFM loss at full-env chunk boundaries only.
-            # x0_new / cond_latent_new cover needs_chunk envs (sub_B ≤ num_envs).
-            # We only write to the buffer when all envs generated together (sub_B == num_envs),
-            # which is the common case: iteration start and every n_open_loop steps without
-            # mid-episode resets. Partial boundaries (episode resets causing desync) are skipped.
-            full_chunk = x0_new is not None and x0_new.shape[0] == cfg.num_envs
-            if full_chunk:
-                old_loss, sigmas, epsilons = policy.compute_cfm_loss_for_storage(
-                    data_batch_new, x0_new, cond_latent_new
-                )
-                last_data_batch  = data_batch_new
-                last_old_loss    = old_loss.numpy()
-                last_sigmas      = sigmas.numpy()
-                last_epsilons    = epsilons.numpy()
-
-            # Critic value estimate — use per-env stored latents for correctness
-            with torch.no_grad():
-                all_cond = policy.get_env_cond_latents(env_list)
-                if all_cond is not None:
-                    v = policy.get_value(all_cond).cpu().squeeze(-1).numpy()  # (B,)
-                else:
-                    v = np.zeros(cfg.num_envs, dtype=np.float32)
-
-            # Step environments
-            obs_list, rewards, dones, truncateds, infos = envs.step(actions_np)
-
-            # Handle episode resets
-            reset_envs = np.where(dones | truncateds)[0]
-            if len(reset_envs) > 0:
-                policy.reset_buffers(env_indices=reset_envs.tolist())
-                for i in reset_envs:
-                    success_buffer.append(float(infos[i].get("success", False)))
-                    ep_rew_buffer.append(cur_ep_rew[i])
-                    ep_len_buffer.append(cur_ep_len[i])
-                    cur_ep_rew[i] = 0.0
-                    cur_ep_len[i] = 0.0
-
-            cur_ep_rew += rewards
-            cur_ep_len += 1.0
-            total_steps += cfg.num_envs
-
-            # Store CFM data in buffer only at full-env chunk boundaries.
-            if full_chunk:
-                buf_x0   = policy.get_env_x0_latents(env_list, device="cpu")
-                buf_cond = policy.get_env_cond_latents(env_list, device="cpu")
-            else:
-                buf_x0 = buf_cond = None
-
-            buf.add(
-                step_idx=step,
-                rewards=rewards,
-                dones=dones | truncateds,
-                values=v,
-                old_cfm_loss=last_old_loss if full_chunk else None,
-                sigmas=last_sigmas if full_chunk else None,
-                epsilons=last_epsilons if full_chunk else None,
-                x0_latent=buf_x0,
-                cond_latent=buf_cond,
-                data_batch=last_data_batch if full_chunk else None,
-            )
-
-        # Bootstrap last value using per-env stored cond latents
-        with torch.no_grad():
-            all_cond = policy.get_env_cond_latents(env_list)
-            if all_cond is not None:
-                last_v = policy.get_value(all_cond).cpu().squeeze(-1).numpy()
-            else:
-                last_v = np.zeros(cfg.num_envs, dtype=np.float32)
-
-        advantages, returns = calculate_advantage(
-            buf.values, buf.rewards, buf.dones, last_v,
-            gamma=cfg.gamma, gae_lambda=cfg.gae_lambda,
+        obs_list, total_steps = _collect_rollout(
+            cfg, policy, envs, buf, obs_list, total_steps,
+            success_buffer, ep_rew_buffer, ep_len_buffer, cur_ep_rew, cur_ep_len,
         )
+        advantages, returns = _compute_normalized_gae(cfg, policy, buf)
+        losses = _fpo_update(cfg, policy, optimizer, buf, advantages, returns, trainable_params)
 
-        # Normalise advantages globally
-        adv_mean = advantages.mean()
-        adv_std  = advantages.std() + 1e-8
-        advantages = (advantages - adv_mean) / adv_std
-
-        # ── 8b. FPO++ update ──────────────────────────────────────────────
-        model.train()
-        critic.train()
-
-        mean_pg_loss   = 0.0
-        mean_vf_loss   = 0.0
-        mean_ratio     = 0.0
-        n_updates      = 0
-
-        for epoch in range(cfg.update_epochs):
-            for (adv_mb, ret_mb, old_loss_mb, sigmas_mb, eps_mb,
-                 x0_mb, cond_mb, db_mb) in buf.get_mini_batches(
-                    cfg.num_mini_batches, advantages, returns
-            ):
-                adv_mb      = adv_mb.cuda()         # (mb*B, 1)
-                ret_mb      = ret_mb.cuda()         # (mb*B, 1)
-                old_loss_mb = old_loss_mb.cuda()    # (mb*B, N)
-                sigmas_mb   = sigmas_mb.cuda()      # (mb*B, N)
-                eps_mb      = eps_mb.cuda()         # (mb*B, N, C, H, W)
-                x0_mb       = x0_mb.cuda()          # (mb*B, C, T=11, H, W)
-                cond_mb     = cond_mb.cuda()        # (mb*B, C, T=11, H, W)
-
-                # --- FPO surrogate loss ---
-                new_cfm_loss = policy.compute_cfm_loss(
-                    db_mb, x0_mb.detach(), cond_mb, sigmas_mb, eps_mb
-                )  # (B_mb, N)  — has grad through LoRA
-
-                pg_loss = fpo_surrogate_loss(
-                    old_cfm_loss=old_loss_mb,
-                    new_cfm_loss=new_cfm_loss,
-                    advantages=adv_mb,
-                    clip_coef=cfg.clip_coef,
-                    trust_region_mode=cfg.trust_region_mode,
-                )
-
-                # --- Value loss ---
-                v_pred = policy.get_value(cond_mb)  # (B_mb, 1)
-                vf_loss = ((v_pred - ret_mb) ** 2).mean()
-
-                # --- Combined loss ---
-                loss = pg_loss + cfg.vf_coef * vf_loss
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(lora_params + critic_params, cfg.max_grad_norm)
-                optimizer.step()
-
-                with torch.no_grad():
-                    ratio = torch.exp(old_loss_mb - new_cfm_loss)
-                    mean_ratio += ratio.mean().item()
-
-                mean_pg_loss += pg_loss.item()
-                mean_vf_loss += vf_loss.item()
-                n_updates += 1
-
-        if n_updates > 0:
-            mean_pg_loss /= n_updates
-            mean_vf_loss /= n_updates
-            mean_ratio   /= n_updates
-
-        # ── 8c. Logging ───────────────────────────────────────────────────
-        t_iter_end = time.perf_counter()
-        iter_time  = t_iter_end - t_iter_start
-        fps = (cfg.steps_per_iter * cfg.num_envs) / iter_time
+        lr_scheduler.step()
+        iter_time = time.perf_counter() - t_start
+        fps = cfg.steps_per_iter * cfg.num_envs / iter_time
 
         if iteration % cfg.log_interval == 0:
-            writer.add_scalar("Loss/policy",    mean_pg_loss, total_steps)
-            writer.add_scalar("Loss/value",     mean_vf_loss, total_steps)
-            writer.add_scalar("FPO/ratio",      mean_ratio,   total_steps)
-            writer.add_scalar("Perf/fps",       fps,          total_steps)
-            writer.add_scalar("Perf/iter_time", iter_time,    total_steps)
+            _log_iteration(cfg, iteration, num_iterations, losses, optimizer,
+                           fps, iter_time, total_steps,
+                           success_buffer, ep_rew_buffer, ep_len_buffer)
 
-            if success_buffer:
-                writer.add_scalar("Train/success_rate",      np.mean(success_buffer), total_steps)
-                writer.add_scalar("Train/mean_ep_reward",    np.mean(ep_rew_buffer),  total_steps)
-                writer.add_scalar("Train/mean_ep_length",    np.mean(ep_len_buffer),  total_steps)
-
-            print(
-                f"Iter {iteration:4d}/{num_iterations}  "
-                f"steps={total_steps:,}  "
-                f"fps={fps:5.0f}  "
-                f"pg={mean_pg_loss:.4f}  vf={mean_vf_loss:.4f}  "
-                f"ratio={mean_ratio:.4f}  "
-                + (f"succ={np.mean(success_buffer):.3f}" if success_buffer else "succ=n/a")
-            )
-
-        # ── 8d. Checkpoint ────────────────────────────────────────────────
         if iteration % cfg.save_interval == 0:
-            ckpt_path = os.path.join(cfg.log_dir, f"ckpt_{iteration:05d}.pt")
-            save_checkpoint(ckpt_path, model, critic, optimizer, iteration)
+            save_checkpoint(os.path.join(cfg.log_dir, f"ckpt_{iteration:05d}.pt"),
+                            model, optimizer, iteration)
 
-        # Reset buffer pointer
+        if (cfg.eval_rollout_freq > 0
+                and (iteration % cfg.eval_rollout_freq == 0
+                     or iteration == num_iterations)):
+            print(f"[eval] Running {cfg.eval_num_episodes} episodes …")
+            eval_sr = run_eval(policy, envs, cfg.eval_num_episodes)
+            print(f"[eval] iter={iteration}  success_rate={eval_sr:.3f}")
+            if cfg.wandb_enable:
+                wandb.log({"eval/success_rate": eval_sr,
+                           "eval/episodes": cfg.eval_num_episodes}, step=total_steps)
+            obs_list, _ = envs.reset()
+            policy.reset_buffers()
+
         buf.ptr = 0
 
-    # ── 9. Final checkpoint ───────────────────────────────────────────────
     save_checkpoint(os.path.join(cfg.log_dir, "ckpt_final.pt"),
-                    model, critic, optimizer, iteration)
+                    model, optimizer, iteration)
     envs.close()
-    writer.close()
+    if cfg.wandb_enable:
+        wandb.finish()
     print("Training complete.")
 
 
@@ -663,14 +639,10 @@ def train(cfg: TrainConfig):
 def _parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="FPO++ Cosmos Policy on RoboCasa")
     cfg = TrainConfig()
-
     for f in cfg.__dataclass_fields__:
         default = getattr(cfg, f)
-        t = type(default)
-        p.add_argument(f"--{f}", type=t, default=default)
-
-    args = p.parse_args()
-    return TrainConfig(**vars(args))
+        p.add_argument(f"--{f}", type=type(default), default=default)
+    return TrainConfig(**vars(p.parse_args()))
 
 
 if __name__ == "__main__":
