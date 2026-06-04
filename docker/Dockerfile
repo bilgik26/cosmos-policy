@@ -32,6 +32,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
         libegl1-mesa-dev \
         libgl1-mesa-dri \
         libglib2.0-0 \
+        libosmesa6 \
         sudo \
         tree \
         wget \

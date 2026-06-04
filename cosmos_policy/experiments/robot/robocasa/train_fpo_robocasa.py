@@ -330,17 +330,32 @@ def _setup_optimizer_and_scheduler(cfg: TrainConfig, model, num_iterations: int)
     return trainable_params, optimizer, lr_scheduler
 
 
+_TASK_MAX_STEPS = {
+    "PnPCounterToCab": 500, "PnPCabToCounter": 500, "PnPCounterToSink": 700,
+    "PnPSinkToCounter": 500, "PnPCounterToMicrowave": 600, "PnPMicrowaveToCounter": 500,
+    "PnPCounterToStove": 500, "PnPStoveToCounter": 500,
+    "OpenSingleDoor": 500, "CloseSingleDoor": 500, "OpenDoubleDoor": 1000,
+    "CloseDoubleDoor": 700, "OpenDrawer": 500, "CloseDrawer": 500,
+    "TurnOnStove": 500, "TurnOffStove": 500,
+    "TurnOnSinkFaucet": 500, "TurnOffSinkFaucet": 500, "TurnSinkSpout": 500,
+    "CoffeeSetupMug": 600, "CoffeeServeMug": 600, "CoffeePressButton": 300,
+    "TurnOnMicrowave": 500, "TurnOffMicrowave": 500,
+}
+
+
 def _setup_envs(cfg: TrainConfig):
     from cosmos_policy.experiments.robot.robocasa.robocasa_gym_wrapper import (
         VectorizedRoboCasaEnv,
     )
-    print(f"[init] Starting {cfg.num_envs} RoboCasa environments …")
+    max_steps = _TASK_MAX_STEPS.get(cfg.task_name, 500)
+    print(f"[init] Starting {cfg.num_envs} RoboCasa environments (max_steps={max_steps}) …")
     return VectorizedRoboCasaEnv(
         task_name=cfg.task_name,
         num_envs=cfg.num_envs,
         base_seed=cfg.seed,
         img_res=cfg.img_res,
         obj_instance_split=cfg.obj_instance_split,
+        max_steps=max_steps,
     )
 
 

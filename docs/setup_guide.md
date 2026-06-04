@@ -7,6 +7,7 @@
 - HuggingFace アカウント＋以下のモデルへのアクセス申請・承認済み
   - `nvidia/Cosmos-Predict2-2B-Video2World`
   - `nvidia/Cosmos-Policy-RoboCasa-Predict2-2B`
+- [Weights & Biases](https://wandb.ai) アカウント（FPO 学習のログ記録に使用）
 
 ---
 
@@ -319,10 +320,119 @@ logs/
 
 ### `Cannot initialize a EGL device display`
 
-`__EGL_VENDOR_LIBRARY_FILENAMES` が設定されていない場合に発生。
+**パターン 1: `__EGL_VENDOR_LIBRARY_FILENAMES` 未設定**
+
 `-e __EGL_VENDOR_LIBRARY_FILENAMES=/workspace/cosmos_policy/experiments/robot/libero/10_nvidia.json` を指定すること。
+
+**パターン 2: `libEGL_nvidia.so.0` が存在しない（compute-only ドライバ環境）**
+
+`__EGL_VENDOR_LIBRARY_FILENAMES` を正しく設定しても解消しない場合、サーバーに display/graphics 用の NVIDIA ドライバパッケージ（`libEGL_nvidia.so.0` を含む）がインストールされていない可能性がある。
+
+```bash
+# 確認方法
+find / -name "libEGL_nvidia*" 2>/dev/null
+```
+
+何も見つからない場合、`libnvidia-compute-*-server` 等の compute-only ドライバが使用されている。この場合は EGL の代わりに OSMesa（CPU ソフトウェアレンダリング）を使用する。
+
+**対処手順:**
+
+1. Dockerfile に `libosmesa6` を追加する:
+
+```dockerfile
+apt-get install -y --no-install-recommends \
+    ...
+    libosmesa6 \
+    ...
+```
+
+2. Docker イメージを再ビルドする:
+
+```bash
+docker build -t cosmos-policy docker
+```
+
+3. `docker run` コマンドの EGL 関連環境変数を以下に置き換える:
+
+```bash
+# 削除:
+# -e MUJOCO_GL=egl
+# -e PYOPENGL_PLATFORM=egl
+# -e __EGL_VENDOR_LIBRARY_FILENAMES=...
+
+# 追加:
+-e MUJOCO_GL=osmesa
+```
+
+OSMesa は GPU レンダリングではなく CPU でのソフトウェアレンダリングになるが、シミュレーション自体（MuJoCo の物理演算・学習）は引き続き GPU で実行される。
 
 ### `GatedRepoError: 401 Client Error`
 
 `HF_TOKEN` 環境変数が未設定、またはモデルへのアクセス申請が未承認。
 HuggingFace で `nvidia/Cosmos-Predict2-2B-Video2World` と `nvidia/Cosmos-Policy-RoboCasa-Predict2-2B` へのアクセスをリクエストし、承認後に `-e HF_TOKEN=<YOUR_HF_TOKEN>` を設定すること。
+
+---
+
+## W&B（Weights & Biases）認証
+
+FPO 学習スクリプト（`train_fpo_robocasa.sh`）は W&B にトレーニングログを記録する。
+
+### API キーの取得
+
+1. [wandb.ai/settings](https://wandb.ai/settings) を開く
+2. **Danger Zone** → **API keys** セクションで新しいキーを生成する
+3. キーは `wandb_v1_<前半>_<後半>` の形式（全体で 80 文字以上）
+
+**注意:** キーをコピーする際は必ずフル文字列を取得すること。`wandb_v1_` プレフィックスを含む全体が必要。後半部分のみでは認証が失敗する（`API key must have 40+ characters` エラー）。
+
+### 使い方
+
+`docker run` コマンドに環境変数として渡す:
+
+```bash
+-e WANDB_API_KEY=wandb_v1_<YOUR_FULL_KEY>
+```
+
+スクリプトでは `--wandb_enable True --wandb_project <プロジェクト名>` を指定する（デフォルト: `fpo-cosmos-robocasa`）。
+
+### 動作確認
+
+```bash
+docker run \
+  -u root \
+  -e HOST_USER_NAME=ubuntu \
+  -e HOST_USER_ID=$(id -u) \
+  -e HOST_GROUP_ID=$(id -g) \
+  -v $HOME/.cache:/home/ubuntu/.cache \
+  -v $HOME/.local:/home/ubuntu/.local \
+  -v ~/cosmos-policy:/workspace \
+  -e WANDB_API_KEY=wandb_v1_<YOUR_FULL_KEY> \
+  --rm -w /workspace cosmos-policy \
+  bash -c "
+    source .venv/bin/activate
+    python -c \"
+import wandb
+run = wandb.init(project='fpo-cosmos-robocasa', name='auth-test')
+wandb.log({'test': 1})
+wandb.finish()
+print('wandb OK')
+\"
+  "
+```
+
+`wandb OK` と表示されれば認証成功。W&B の Run URL も出力される。
+
+### オフラインモード（認証なしで実行する場合）
+
+ネットワーク接続や API キーが不要な場合は `WANDB_MODE=offline` を使用する。
+ログはローカルに保存され、後から同期できる:
+
+```bash
+-e WANDB_MODE=offline
+```
+
+```bash
+# 後からクラウドへ同期する場合
+source .venv/bin/activate
+wandb sync runs/<log_dir>/wandb/offline-run-<timestamp>
+```

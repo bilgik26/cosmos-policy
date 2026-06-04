@@ -95,13 +95,17 @@ class RoboCasaGymWrapper:
         flip_images: bool = True,
         obj_instance_split: str = "B",
         layout_and_style_ids: Optional[list] = None,
+        max_steps: int = 500,
     ):
         import pickle
+        import robocasa  # registers RoboCasa envs with robosuite
         import robosuite
 
         self.task_name = task_name
         self.flip_images = flip_images
         self._task_description: str = ""
+        self._max_steps = max_steps
+        self._step_count = 0
 
         controller_path = (
             "cosmos_policy/experiments/robot/robocasa/robocasa_controller_configs.pkl"
@@ -139,6 +143,7 @@ class RoboCasaGymWrapper:
     # ------------------------------------------------------------------
     def reset(self) -> Tuple[Dict[str, np.ndarray], dict]:
         raw_obs = self.env.reset()
+        self._step_count = 0
         # Task description changes with every scene reset
         self._task_description = self.env.get_ep_meta()["lang"]
         obs = _extract_obs(raw_obs, self.flip_images)
@@ -157,11 +162,13 @@ class RoboCasaGymWrapper:
         if action.shape[-1] == POLICY_ACTION_DIM and self.env.action_dim == ENV_ACTION_DIM:
             action = np.concatenate([action, _MOBILE_BASE_ZEROS])
         raw_obs, _, done, info = self.env.step(action)
+        self._step_count += 1
         success = bool(self.env._check_success())
         reward = 1.0 if success else 0.0
+        truncated = self._step_count >= self._max_steps
         obs = _extract_obs(raw_obs, self.flip_images)
         obs["task_description"] = self._task_description
-        return obs, reward, done, False, {"success": success}
+        return obs, reward, done or success, truncated, {"success": success}
 
     @property
     def task_description(self) -> str:
@@ -183,6 +190,7 @@ def _worker_fn(
     obj_instance_split: str,
     cmd_q: mp.Queue,
     obs_q: mp.Queue,
+    max_steps: int = 500,
 ):
     """Worker process: owns one RoboCasaGymWrapper and processes commands."""
     try:
@@ -192,6 +200,7 @@ def _worker_fn(
             img_res=img_res,
             flip_images=flip_images,
             obj_instance_split=obj_instance_split,
+            max_steps=max_steps,
         )
         obs_q.put(("ready", None))
 
@@ -249,6 +258,7 @@ class VectorizedRoboCasaEnv:
         img_res: int = 224,
         flip_images: bool = True,
         obj_instance_split: str = "B",
+        max_steps: int = 500,
     ):
         self.num_envs = num_envs
         self.action_dim = POLICY_ACTION_DIM
@@ -270,6 +280,7 @@ class VectorizedRoboCasaEnv:
                     obj_instance_split,
                     cq,
                     oq,
+                    max_steps,
                 ),
                 daemon=True,
             )
