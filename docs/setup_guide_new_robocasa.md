@@ -64,7 +64,7 @@ sudo docker run \
 
 ```bash
 cd ~/cosmos-policy
-git clone https://github.com/bilgik26/robocasa.git new_robocasa
+git clone -b dev https://github.com/bilgik26/robocasa.git new_robocasa
 ```
 
 クローン先: `~/cosmos-policy/robocasa/`
@@ -307,7 +307,7 @@ sudo docker run \
       --num_open_loop_steps 16 \
       --task_name TurnOffMicrowave \
       --obj_instance_split target \
-      --num_trials_per_task 50 \
+      --num_trials_per_task 1 \
       --run_id_note my_eval \
       --local_log_dir cosmos_policy/experiments/robot/robocasa/logs/ \
       --seed 195 \
@@ -345,6 +345,193 @@ sudo docker run \
 | `--chunk_size` | `32` | アクションチャンクサイズ |
 | `--num_open_loop_steps` | `16` | オープンループ実行ステップ数 |
 | `--obj_instance_split` | `"target"` | オブジェクト分割（`"target"` = テスト用、`"pretrain"` = 訓練用） |
+
+---
+
+## Step 5: 学習用データセットのダウンロード
+
+新 RoboCasa のデータセットは HuggingFace Hub からダウンロードする。全 65 タスクをダウンロードすると 100 GB 超になるため、まず代表的な 10 タスクで動作確認することを推奨する。
+
+### 5-1. 永続コンテナの起動
+
+学習は数時間〜数日かかるため、`--rm` なしの**永続コンテナ**を使用する。
+
+```bash
+sudo docker run \
+  -u root \
+  -e HOST_USER_NAME=ubuntu \
+  -e HOST_USER_ID=$(id -u) \
+  -e HOST_GROUP_ID=$(id -g) \
+  -e HF_HOME=/home/ubuntu/.cache/huggingface \
+  -v $HOME/.cache:/home/ubuntu/.cache \
+  -v $HOME/.local:/home/ubuntu/.local \
+  -v ~/cosmos-policy:/workspace \
+  --gpus all \
+  --ipc=host \
+  --name cosmos_train \
+  -w /workspace \
+  --entrypoint bash \
+  -d \
+  cosmos-policy \
+  -c "sleep infinity"
+```
+
+> **`-v $HOME/.local:/home/ubuntu/.local` について:** `.venv/bin/python` のシンボリックリンクは `uv` が管理する Python インタープリタ（`/home/ubuntu/.local/share/uv/python/.../bin/python3.10`）を参照する。このマウントがないと `.venv/bin/python` が「存在しないパス」を指して `No such file or directory` になる。
+
+> **同名コンテナが既に存在する場合:** `sudo docker rm -f cosmos_train` で削除してから再実行する。
+
+### 5-2. データセットのダウンロード
+
+以下の 10 タスクをダウンロードする（学習の動作確認用）:
+
+| タスク名 | カテゴリ |
+|---|---|
+| `CloseFridge` / `OpenFridge` | 冷蔵庫 |
+| `TurnOnSinkFaucet` / `TurnOffSinkFaucet` | シンク |
+| `TurnOnMicrowave` / `TurnOffMicrowave` | 電子レンジ |
+| `OpenCabinet` / `CloseCabinet` | キャビネット |
+| `PickPlaceCounterToCabinet` / `PickPlaceCabinetToCounter` | 物体操作 |
+
+```bash
+sudo docker exec cosmos_train bash -c "
+  source /workspace/.venv/bin/activate
+  for TASK in CloseFridge OpenFridge TurnOnSinkFaucet TurnOffSinkFaucet \
+              TurnOnMicrowave TurnOffMicrowave OpenCabinet CloseCabinet \
+              PickPlaceCounterToCabinet PickPlaceCabinetToCounter; do
+    echo \"=== Downloading: \$TASK ===\"
+    python -c \"
+from robocasa.scripts.download_datasets import download_datasets
+download_datasets(split=['pretrain'], tasks=['\$TASK'], source=['human'], overwrite=False)
+\"
+  done
+"
+```
+
+ダウンロード先: `/workspace/robocasa/datasets/v1.0/pretrain/atomic/<TaskName>/`
+
+各タスクのデータ形式（LeRobot 形式）:
+```
+datasets/v1.0/pretrain/atomic/<TaskName>/
+├── data/
+│   └── chunk-000/
+│       ├── episode_000000.parquet   # アクション・固有感覚データ
+│       └── ...
+└── videos/
+    └── chunk-000/
+        ├── observation.images.agentview_image/<episode>.mp4
+        ├── observation.images.robot0_eye_in_hand_image/<episode>.mp4
+        └── ...
+```
+
+10 タスクダウンロード後の統計:
+- エピソード数: 約 1,000
+- 総ステップ数: 約 220,000
+- ユニークタスク説明: 約 137 件
+
+---
+
+## Step 6: T5テキスト埋め込みの生成
+
+Cosmos Policy はテキストコンディショニングに T5 エンコーダを使用する。実行時にオンザフライでエンコードするとメモリ不足（OOM）になるため、事前に全タスク説明をエンコードして `.pkl` ファイルに保存する。
+
+```bash
+sudo docker exec cosmos_train bash -c "
+  source /workspace/.venv/bin/activate
+  HF_TOKEN=<YOUR_HF_TOKEN> \
+  python -m cosmos_policy.datasets.save_new_robocasa_t5_text_embeddings \
+    --output_path /workspace/robocasa/datasets/new_robocasa_t5_embeddings.pkl
+"
+```
+
+出力:
+- ファイル: `/workspace/robocasa/datasets/new_robocasa_t5_embeddings.pkl`
+- サイズ: 約 154 MB
+- 内容: ユニークタスク説明 153 件の T5 埋め込み（shape: `[seq_len=512, dim=1024]`）
+
+HuggingFace からダウンロードしたデータセットに含まれる全タスク説明を自動収集してエンコードするため、ダウンロード済みタスクが増えた場合は再実行すること。
+
+---
+
+## Step 7: 学習の実行
+
+### 7-1. 学習関連ファイルの概要
+
+新 RoboCasa 対応のために新規作成・修正したファイル:
+
+| ファイル | 種別 | 概要 |
+|---|---|---|
+| `cosmos_policy/datasets/new_robocasa_dataset.py` | 新規 | LeRobot 形式（parquet + MP4）→ PyTorch Dataset |
+| `cosmos_policy/datasets/save_new_robocasa_t5_text_embeddings.py` | 新規 | T5 埋め込みの事前計算スクリプト |
+| `cosmos_policy/config/experiment/new_robocasa_experiment_configs.py` | 新規 | 実験設定（モデル・データローダー・最適化パラメータ） |
+| `cosmos_policy/scripts/train.py` | 修正 | DataLoader に `multiprocessing_context` を渡すよう修正（後述） |
+
+### 7-2. 学習コマンド（1-GPU）
+
+```bash
+sudo docker exec -it cosmos_train bash -c "
+  source /workspace/.venv/bin/activate
+  cd /workspace
+  WANDB_API_KEY=<YOUR_WANDB_API_KEY> \
+  HF_TOKEN=<YOUR_HF_TOKEN> \
+  torchrun --nproc_per_node=1 \
+    -m cosmos_policy.scripts.train \
+    --config=cosmos_policy/config/config.py \
+    -- \
+    experiment='cosmos_predict2_2b_480p_new_robocasa_pretrain_human' \
+    trainer.max_iter=2000 \
+    trainer.logging_iter=10 \
+    trainer.grad_accum_iter=4 \
+    dataloader_train.batch_size=2 \
+    checkpoint.save_iter=500 \
+    job.name='new_robocasa_2000iter'
+"
+```
+
+主要引数:
+
+| 引数 | 値 | 説明 |
+|---|---|---|
+| `experiment` | `cosmos_predict2_2b_480p_new_robocasa_pretrain_human` | 実験設定名（`new_robocasa_experiment_configs.py` で定義） |
+| `trainer.max_iter` | `2000` | 学習イテレーション数 |
+| `trainer.grad_accum_iter` | `4` | 勾配累積ステップ数（実効バッチサイズ = `batch_size × grad_accum_iter = 8`） |
+| `dataloader_train.batch_size` | `2` | 1-GPU (A100-40GB) でのバッチサイズ上限 |
+| `checkpoint.save_iter` | `500` | チェックポイント保存間隔 |
+
+### 7-3. 期待される出力と性能
+
+- 学習速度: 約 4.4 秒 / イテレーション（A100-40GB、1-GPU）
+- GPU 使用率: 約 98%、VRAM 使用量: 約 36 GB
+- 2000 イテレーション所要時間: 約 2.7 時間
+
+損失値の推移（10 タスク、ランダム重みから学習開始）:
+
+```
+[iter   10]  loss: ~9100  (学習開始直後)
+[iter  500]  loss: ~3-4
+[iter 1000]  loss: ~1.5-2
+[iter 2000]  loss: ~1.2-1.3
+```
+
+### 7-4. チェックポイントの保存先
+
+チェックポイントは以下に保存される:
+
+```
+/tmp/experiments/cosmos_v2_finetune/<job.name>/
+├── config.yaml
+├── 0000000500/    # iter=500
+├── 0001000000/    # iter=1000
+└── 0002000000/    # iter=2000
+```
+
+> `/tmp` は Docker コンテナ再起動で消えるため、重要なチェックポイントはホストにコピーすること:
+> ```bash
+> sudo docker cp cosmos_train:/tmp/experiments ~/cosmos-policy/checkpoints/
+> ```
+
+### 7-5. wandb でのモニタリング
+
+`WANDB_API_KEY` を設定して起動すると、学習の進捗を wandb でリアルタイムに確認できる。ログは `https://wandb.ai/<YOUR_USERNAME>/cosmos_policy/` に自動で記録される。
 
 ---
 
@@ -477,6 +664,41 @@ uv pip install 'numba==0.63.1' 'llvmlite==0.46.0'
 **原因:** `--t5_text_embeddings_path` で指定したキャッシュファイルに、実行中のタスク説明が登録されていない場合にオンザフライで T5 モデルを GPU にロードしようとする。新 RoboCasa のタスク説明は先頭大文字・末尾ピリオドありの形式（例: `"Press the stop button on the microwave."`）だが、事前計算済みキャッシュは小文字・末尾ピリオドなし形式（例: `"press the stop button on the microwave"`）で登録されているため、キャッシュミスが発生する。
 
 **修正:** `run_robocasa_eval_new.py` はタスク説明を `.lower().rstrip(".")` で正規化してからキャッシュを検索する（`run_task()` 関数内）。旧スクリプトを使っている場合は手動で正規化するか、T5 推論用 GPU メモリを確保すること。
+
+---
+
+### DataLoader が固まって学習が進まない（`futex_wait_queue` デッドロック）
+
+**症状:** wandb 初期化後、最初のデータ取得（`next(dataloader_train_iter)`）でプロセスが無限にブロックされ、GPU 使用率が 0% のまま何時間経過しても最初のイテレーションが完了しない。
+
+**原因:** `train.py` が DataLoader を `multiprocessing_context` 未指定で生成するため、デフォルト（`fork`）が使用される。FSDP・wandb・PyTorch インダクタのコンパイルワーカー（計 100 スレッド以上）が起動した後に `fork` すると、GIL を保持したまま fork されたスレッドが子プロセス内で `futex_wait_queue` にブロックされ、全 DataLoader ワーカーがデッドロックする。
+
+**修正（既に適用済み）:**
+
+1. `cosmos_policy/scripts/train.py` の DataLoader 生成部分（行 71〜82）に `multiprocessing_context` を追加:
+   ```python
+   dataloader_train = DataLoader(
+       ...
+       multiprocessing_context=getattr(config.dataloader_train, "multiprocessing_context", None),
+   )
+   ```
+
+2. `cosmos_policy/config/experiment/new_robocasa_experiment_configs.py` の `dataloader_train` に設定を追加:
+   ```python
+   dataloader_train=L(DataLoader)(
+       num_workers=4,
+       multiprocessing_context="spawn",   # fork-after-multithread デッドロックを回避
+       persistent_workers=True,
+       ...
+   )
+   ```
+
+`"spawn"` は既存スレッドを引き継がない新しい Python インタープリタを起動するため、fork 起因のデッドロックが発生しない。
+
+**応急処置（`train.py` を修正できない場合）:** `dataloader_train.num_workers=0` を学習コマンドに追加するとシングルスレッドで動作する（速度は約 8.6 秒/iter と低下）:
+```bash
+torchrun ... -- ... dataloader_train.num_workers=0
+```
 
 ---
 

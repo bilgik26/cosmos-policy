@@ -78,6 +78,7 @@ def launch(config: Config, args: argparse.Namespace) -> None:
             pin_memory=config.dataloader_train.pin_memory,
             pin_memory_device=config.dataloader_train.pin_memory_device,
             timeout=config.dataloader_train.timeout,
+            multiprocessing_context=getattr(config.dataloader_train, "multiprocessing_context", None),
         )
 
         dataloader_val = None
