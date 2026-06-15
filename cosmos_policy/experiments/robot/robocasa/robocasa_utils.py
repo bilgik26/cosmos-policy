@@ -33,7 +33,9 @@ def save_rollout_video(
     log_file=None,
 ):
     """Saves an MP4 replay of an episode with all three camera views."""
-    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:40]
+    processed_task_description = (
+        task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_").replace("/", "_")[:40]
+    )
     mp4_path = (
         f"{rollout_data_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
     )
@@ -97,7 +99,9 @@ def save_rollout_video_with_future_image_predictions(
         show_timestep: If True, show the timestep on the video
         timestep: The current timestep
     """
-    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+    processed_task_description = (
+        task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_").replace("/", "_")[:50]
+    )
     mp4_path = f"{rollout_data_dir}/{DATE_TIME}--with_future_img--episode={idx}--success={success}--task={processed_task_description}.mp4"
     video_writer = imageio.get_writer(mp4_path, fps=30)
 
@@ -261,7 +265,9 @@ def save_rollout_video_with_future_image_predictions_and_gt(
         show_timestep: If True, show the timestep on the video
         timestep: The current timestep
     """
-    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+    processed_task_description = (
+        task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_").replace("/", "_")[:50]
+    )
     mp4_path = f"{rollout_data_dir}/{DATE_TIME}--with_future_img--episode={idx}--success={success}--task={processed_task_description}--gt.mp4"
     video_writer = imageio.get_writer(mp4_path, fps=30)
 

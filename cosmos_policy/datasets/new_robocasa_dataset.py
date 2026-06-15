@@ -558,7 +558,7 @@ class NewRoboCasaDataset(Dataset):
             "__key__": idx,
             "rollout_data_mask": 0,
             "rollout_data_success_mask": 0,
-            "world_model_sample_mask": 1,
+            "world_model_sample_mask": 0,
             "value_function_sample_mask": 0,
             "global_rollout_idx": -1,
             # Latent sequence indices for the model
