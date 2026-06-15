@@ -384,20 +384,18 @@ sudo docker run \
 
 以下の 10 タスクをダウンロードする（学習の動作確認用）:
 
-| タスク名 | カテゴリ |
-|---|---|
-| `CloseFridge` / `OpenFridge` | 冷蔵庫 |
-| `TurnOnSinkFaucet` / `TurnOffSinkFaucet` | シンク |
-| `TurnOnMicrowave` / `TurnOffMicrowave` | 電子レンジ |
-| `OpenCabinet` / `CloseCabinet` | キャビネット |
-| `PickPlaceCounterToCabinet` / `PickPlaceCabinetToCounter` | 物体操作 |
+| タスク名 |
+|---|
+| `CloseBlenderLid` / `CloseFridge` |
+| `OpenCabinet` / `OpenDrawer` / `OpenStandMixerHead` |
+| `PickPlaceCounterToCabinet` / `PickPlaceCounterToStove` `PickPlaceDrawerToCounter` / `PickPlaceSinkToCounter` / `PickPlaceToasterToCounter` |
 
 ```bash
 sudo docker exec cosmos_train bash -c "
   source /workspace/.venv/bin/activate
-  for TASK in CloseFridge OpenFridge TurnOnSinkFaucet TurnOffSinkFaucet \
-              TurnOnMicrowave TurnOffMicrowave OpenCabinet CloseCabinet \
-              PickPlaceCounterToCabinet PickPlaceCabinetToCounter; do
+  for TASK in CloseBlenderLid CloseFridge OpenCabinet OpenDrawer \
+              OpenStandMixerHead PickPlaceCounterToCabinet PickPlaceCounterToStove PickPlaceDrawerToCounter \
+              PickPlaceSinkToCounter PickPlaceToasterToCounter; do
     echo \"=== Downloading: \$TASK ===\"
     python -c \"
 from robocasa.scripts.download_datasets import download_datasets
@@ -478,12 +476,12 @@ sudo docker exec -it cosmos_train bash -c "
     --config=cosmos_policy/config/config.py \
     -- \
     experiment='cosmos_predict2_2b_480p_new_robocasa_pretrain_human' \
-    trainer.max_iter=2000 \
+    trainer.max_iter=45000 \
     trainer.logging_iter=10 \
-    trainer.grad_accum_iter=4 \
-    dataloader_train.batch_size=2 \
-    checkpoint.save_iter=500 \
-    job.name='new_robocasa_2000iter'
+    trainer.grad_accum_iter=200 \
+    dataloader_train.batch_size=4 \
+    checkpoint.save_iter=5000 \
+    job.name='new_robocasa_atomic10'
 "
 ```
 
