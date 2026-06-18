@@ -333,26 +333,93 @@ logs/
 find / -name "libEGL_nvidia*" 2>/dev/null
 ```
 
-何も見つからない場合、`libnvidia-compute-*-server` 等の compute-only ドライバが使用されている。この場合は EGL の代わりに OSMesa（CPU ソフトウェアレンダリング）を使用する。
+何も見つからない場合、`libnvidia-compute-*-server` 等の compute-only ドライバが使用されている。HPC クラスターや bare-metal GPU サーバーに多い構成。
 
-**対処手順:**
+**対処A（推奨）: GL ライブラリを追加して EGL を有効化する**
 
-1. Dockerfile に `libosmesa6` を追加する:
+compute-only ドライバ環境でも、GL ライブラリパッケージを追加インストールすることで EGL GPU レンダリングを有効にできる。
+OSMesa（CPU レンダリング）よりも正確な画像品質が得られるため、こちらを推奨する。
+
+1. ホストに NVIDIA GL ライブラリをインストールする（ドライババージョンに合わせること）:
+
+```bash
+# 現在のドライババージョンを確認
+nvidia-smi --query-gpu=driver_version --format=csv,noheader
+# 例: 580.105.08
+
+# 対応するバージョンの GL ライブラリをインストール
+sudo apt-get install -y libnvidia-gl-580-server=<DRIVER_VERSION>-0lambda0.22.04.1
+# 例:
+sudo apt-get install -y libnvidia-gl-580-server=580.105.08-0lambda0.22.04.1
+```
+
+パッケージ名のバージョン番号はディストリビューション（Ubuntu 版数・リポジトリ）により異なる。
+`apt-cache show libnvidia-gl-580-server` で利用可能なバージョンを確認すること。
+
+2. Dockerfile に `libegl1`（libglvnd EGL ディスパッチャ）を追加してイメージを再ビルドする:
 
 ```dockerfile
 apt-get install -y --no-install-recommends \
     ...
-    libosmesa6 \
+    libegl1 \
+    libegl1-mesa-dev \
     ...
 ```
-
-2. Docker イメージを再ビルドする:
 
 ```bash
 docker build -t cosmos-policy docker
 ```
 
-3. `docker run` コマンドの EGL 関連環境変数を以下に置き換える:
+`libegl1` は libglvnd の EGL ディスパッチャで、NVIDIA の `libEGL_nvidia.so.0` へのルーティングを担う。
+`libegl1-mesa-dev` のみでは Mesa 実装が使われ `eglInitialize` が失敗するため、両方の指定が必要。
+
+3. CDI（Container Device Interface）仕様を再生成する:
+
+```bash
+sudo nvidia-ctk cdi generate --output /var/run/cdi/nvidia.yaml
+```
+
+`libnvidia-gl-580-server` インストール前に生成された CDI 仕様には EGL/GL ライブラリが含まれていない。
+再生成することで `libEGL_nvidia.so.0` 等がコンテナに自動注入されるようになる。
+
+4. 動作確認:
+
+```bash
+docker run \
+  -u root \
+  -e HOST_USER_NAME=ubuntu \
+  -e HOST_USER_ID=$(id -u) \
+  -e HOST_GROUP_ID=$(id -g) \
+  -v $HOME/.local:/home/ubuntu/.local \
+  -v ~/cosmos-policy:/workspace \
+  -e MUJOCO_GL=egl \
+  -e PYOPENGL_PLATFORM=egl \
+  -e __EGL_VENDOR_LIBRARY_FILENAMES=/workspace/cosmos_policy/experiments/robot/libero/10_nvidia.json \
+  --gpus all --rm -w /workspace \
+  cosmos-policy \
+  bash -c "
+    source .venv/bin/activate
+    python -c '
+import mujoco
+m = mujoco.MjModel.from_xml_string(\"<mujoco/>\")
+r = mujoco.Renderer(m, height=64, width=64)
+r.render()
+print(\"EGL rendering: OK\")
+'
+  "
+```
+
+`EGL rendering: OK` と表示されれば EGL が有効。
+終了時に `OpenGL.raw.EGL._errors.EGLError` の WARNING が出ることがあるが、レンダリング自体には影響しない既知のバグ。
+
+---
+
+**対処B（フォールバック）: OSMesa（CPU ソフトウェアレンダリング）を使用する**
+
+EGL が有効にできない場合の代替手段。CPU レンダリングのため画像品質がわずかに異なり、モデルの成功率に影響する可能性がある（実測: EGL で SUCCESS したエピソードが OSMesa では FAILURE になるケースあり）。
+
+`libosmesa6` は Dockerfile に既に含まれているため、追加作業は不要。
+`docker run` コマンドの EGL 関連環境変数を以下に置き換えるだけでよい:
 
 ```bash
 # 削除:
@@ -364,7 +431,7 @@ docker build -t cosmos-policy docker
 -e MUJOCO_GL=osmesa
 ```
 
-OSMesa は GPU レンダリングではなく CPU でのソフトウェアレンダリングになるが、シミュレーション自体（MuJoCo の物理演算・学習）は引き続き GPU で実行される。
+シミュレーション自体（MuJoCo の物理演算・学習）は引き続き GPU で実行される。
 
 ### `GatedRepoError: 401 Client Error`
 

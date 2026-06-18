@@ -29,6 +29,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
         git-lfs \
         gosu \
         libgl1 \
+        libegl1 \
         libegl1-mesa-dev \
         libgl1-mesa-dri \
         libglib2.0-0 \
