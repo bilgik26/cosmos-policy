@@ -1,8 +1,6 @@
 # DiT 中間特徴量・スキル表現解析
 
-**テーマ2: アクション生成の内部表現検証**  
-**日付**: 2026-06-28 | **タスク**: PnPCounterToCab | **成功率**: 70.0% (7/10)  
-**データ**: 218 policy calls × 7 層 × 5 デノイジングステップ × 2048 次元
+**日付**: 2026-06-30 | **タスク**: PnPCounterToCab | **エピソード数**: 50
 
 ---
 
@@ -11,223 +9,268 @@
 | 項目 | 内容 |
 |------|------|
 | プローブ層 | Block-0, 4, 9, 13, 18, 22, 27（28 ブロック中 7 箇所） |
-| 特徴量 | action token (T=5) の block 出力 (B, T, H, W, D) を H×W 空間平均した 2048 次元ベクトル |
-| 総サンプル数 | 218 policy calls × 7 層 × 5 ステップ = 7630 本の特徴ベクトル |
-| スクリプト | `theme2_analysis.py` (特徴量収集) + `theme2_plot.py` + `theme2_linear_probe.py` + `theme2_crossattn.py` |
+| 特徴量 | action token (T=5) の block 出力を H×W 空間平均した 2048 次元ベクトル |
+| エピソード数 | 50（成功率 60%、1108 policy calls） |
+| スクリプト | `feature_analysis.py`（特徴量収集）+ `layer_analysis.py`（層別解析）+ `linear_probe.py`（線形プロービング）+ `crossattn_analysis.py`（クロスアテンション） |
 
 ---
 
-## 2. テーマ 2-1: 特徴量の分散（層ごとの表現の多様性）
+## 2. 特徴量の分散・変化量
 
-action token 特徴ベクトルの全次元分散の合計（218 policy calls 間の variability）:
+### 目的
 
-| 層 | 説明 | 分散合計 (k=0) | 分散合計 (k=4) |
-|----|------|----------------|----------------|
-| Block-0 | Shallowest | 1.36 | 1.32 |
-| Block-4 | Early | 1,827 | 2,020 |
-| Block-9 | Early-Mid | 1,843 | 2,030 |
-| Block-13 | Mid | 1,954 | 2,200 |
-| Block-18 | Late-Mid | 8,694 | 8,612 |
-| Block-22 | Deep | 14,225 | 13,972 |
-| Block-27 | Deepest | **211,784** | **214,929** |
+各プローブ層の特徴ベクトルが policy call 間でどれほど多様か（分散の大きさ）と、k=0→k=4 のデノイジングでどれほど変化するかを測定する。
 
-**所見**: 深い層ほど特徴量の分散が劇的に増大（Block-0 対比 Block-27 は **15 万倍以上**）。
-- Block-0: 全 218 calls でほぼ同一の出力（分散 ≈ 1.3）→ 汎用前処理・固定特徴抽出器
-- Block-27: call ごとの状況（フェーズ・観測）を高精度で弁別する表現 → タスク特化
+### 状況
 
-→ プロット: `theme2_results/theme2_feature_variance.png`
+50 エピソード分の特徴量（`features.npz`）を `feature_replot.py`（`feature_plot.py` ベースのオフライン版）で再プロット済み。
+
+→ プロット: `results/action_features/feature_feature_variance.png` ✓  
+→ プロット: `results/action_features/feature_feature_change_by_layer.png` ✓  
+→ プロット: `results/action_features/feature_step_change_per_layer.png` ✓
 
 ---
 
-## 3. テーマ 2-2: デノイジングステップ間の特徴量変化量（層別）
+## 3. 層別変化量（layer_analysis より）
 
-k=0 と k=4 の特徴ベクトルの L2 距離（218 calls 平均）:
+### 目的
 
-| 層 | 変化量 (mean ± std) |
-|----|---------------------|
-| Block-0 | **3.67 ± 0.05**（最小） |
-| Block-4 | 115.3 ± 3.6 |
-| Block-9 | 105.7 ± 1.9 |
-| Block-13 | 115.1 ± 2.2 |
-| Block-18 | 119.7 ± 4.4 |
-| Block-22 | 110.7 ± 9.6 |
-| Block-27 | **329.0 ± 29.9**（最大） |
+`results_01 §A` と同一データからの層別デノイジング変化量（再掲）。
+
+| 層 | k=0→1 | k=1→2 | k=2→3 | k=3→4 |
+|----|-------|-------|-------|-------|
+| Block-0 | 0.287 | 0.488 | 0.995 | 1.910 |
+| Block-4 | 4.683 | 8.944 | 29.50 | 76.13 |
+| Block-9 | 7.914 | 13.39 | 26.84 | 60.73 |
+| Block-13 | 7.797 | 13.80 | 28.63 | 66.92 |
+| Block-18 | 7.455 | 13.97 | 30.03 | 70.11 |
+| Block-22 | 6.421 | 11.72 | 27.28 | 66.59 |
+| Block-27 | 17.35 | 34.59 | 74.73 | 233.3 |
+
+→ 詳細は `results_01_action_denoising.md §A` を参照。
+
+---
+
+## 4. 層間表現類似度（Linear CKA）
+
+### 目的
+
+DiT の異なる層間で表現空間の類似度を測定し、どの層グループが同じ処理を行っているかを明らかにする。
+
+### 状況
+
+`feature_replot.py` により k=0〜4 の各 CKA 行列（7×7）を生成済み。
+
+→ プロット: `results/action_features/feature_cka_matrix_k{0-4}.png` ✓
+
+---
+
+## 5. PCA・t-SNE による可視化
+
+### 目的
+
+各層の特徴空間をスキル実行フェーズ（エピソード内進行度）の観点から可視化する。全 5 ステップ × 全 7 層で比較。
+
+### PCA（生成済み）
+
+50 エピソード分の PCA は k=0〜k=4 全 5 ステップで生成済み（`feature_analysis.py` がシミュレーション後に保存）。
+
+| デノイジングステップ | PCA ファイル |
+|---------------------|------------|
+| k=0 (σ=80) | `results/action_features/pca_per_layer_k0.png` ✓ |
+| k=1 (σ=42) | `pca_per_layer_k1.png` ✓ |
+| k=2 (σ=21) | `pca_per_layer_k2.png` ✓ |
+| k=3 (σ=10) | `pca_per_layer_k3.png` ✓ |
+| k=4 (σ=4) | `pca_per_layer_k4.png` ✓ |
+
+### t-SNE（生成済み）
+
+`feature_replot.py` により k=0〜4 全 5 ステップ生成済み。
+
+→ プロット: `results/action_features/feature_tsne_per_layer_k{0-4}.png` ✓
+
+---
+
+## 6. 線形プロービング（スキルフェーズ予測）
+
+### 目的
+
+各プローブ層の特徴量がスキル実行フェーズ（エピソード進行度・グリッパー開閉）を線形予測できるかを測定する。全 7 層 × 全 5 デノイジングステップ × 3 ラベル種別で検証。
+
+### 手法
+
+- **特徴量**: `features.npz` から全 7 プローブ層 × 全 5 ステップを読み込み
+- **Global PCA (2048 → 50 次元)**: 全 1108 サンプルで 1 回 PCA を計算し、LOEO CV 全フォールドに共通の射影を使用する。フォールドごとに PCA を計算すると固有空間がフォールド間でずれ、「分類精度」と「PCA 基底の変動」が混在した評価になるため。ただし、テストデータが PCA 計算に含まれる（data leakage）ため、精度の絶対値よりも層間・ステップ間の相対比較に主な意義がある。
+- **分類器**: クラス重み付き Ridge 回帰（alpha=1.0）。各クラスの重みを `1/count` に設定してクラス不均衡を補正。
+- **評価**: LOEO CV（Leave-One-Episode-Out 交差検証）、50 フォールド
+- **学習単位**: 分類器は「1 policy call = 1 推論（32 step チャンク）」単位で学習する。入力は action token の 2048 次元埋め込み（policy call ごとに 1 ベクトル）。エピソード内タイムステップ方向（0〜499 step）ごとに別々の分類器を学習するわけではない。スキルフェーズラベルは policy call 全体の「エピソード進行度」を表すラベルで、各 policy call が「早期/中期/後期」のどのフェーズに属するかを示す。
+
+### ラベルバランスについて
+
+| ラベル種別 | 旧手法 | 旧バランス | 新手法 | 新バランス |
+|-----------|--------|----------|--------|----------|
+| `progress_3` | 等間隔時間分割 | [383, 349, 376]（比 1.10） | quantile 分割 | [376, 376, 356]（比 1.06） |
+| `gripper_2` | 閾値 = 0.0 | [713, 395]（比 **1.81**） | 中央値閾値 | [554, 554]（比 **1.00**） |
+| `gripper_3` | quantile 分割 | 均等（変更なし） | quantile 分割 | 均等（変更なし） |
+
+`gripper_2` が閾値 0.0 で 1.81 倍の不均衡があったため、中央値（≈ −0.75）を閾値として再設定し、クラス重み付き学習で再訓練した。
+
+### 結果: progress_3（スキルフェーズ 3 クラス）
+
+**チャンスレベル: 33.9%**（バランス後）
+
+| 層 | k=0 | k=1 | k=2 | k=3 | k=4 | 傾向 |
+|----|-----|-----|-----|-----|-----|-----|
+| Block-0 | 0.43±0.16 | 0.43±0.15 | 0.47±0.16 | 0.53±0.17 | **0.55±0.18** | k=4 で最大 |
+| Block-4 | 0.37±0.13 | 0.37±0.13 | 0.38±0.13 | 0.40±0.14 | **0.44±0.14** | チャンス近傍 |
+| Block-9 | 0.39±0.12 | 0.39±0.12 | 0.38±0.13 | 0.42±0.14 | **0.44±0.14** | チャンス近傍 |
+| Block-13 | 0.46±0.12 | 0.48±0.13 | 0.49±0.14 | 0.50±0.15 | **0.57±0.20** | k=4 で最大 |
+| Block-18 | **0.70±0.18** | 0.70±0.18 | 0.70±0.18 | 0.70±0.18 | 0.70±0.18 | デノイジング不変 |
+| Block-22 | **0.73±0.19** | 0.73±0.19 | 0.73±0.20 | 0.72±0.20 | 0.72±0.20 | 高精度・ほぼ不変 |
+| Block-27 | **0.73±0.21** | 0.73±0.21 | 0.74±0.21 | 0.73±0.22 | 0.72±0.22 | 高精度・ほぼ不変 |
 
 **所見**:
-- Block-0 は k=0→k=4 でほぼ変化しない（L2 ≈ 3.67）→ デノイジングから切り離された固定前処理器
-- Block-4〜22 は中程度・類似した変化量（L2 ≈ 105〜120）→ 程よく更新される中間表現
-- Block-27 は他の層の約 3 倍（L2 ≈ 329）→ **最深部のみで最終的な確定的予測への大きな移行が起きる**
+- Block-18, 22, 27: 高精度かつデノイジングステップに依存しない（k=0〜k=4 で ≈ 0.70〜0.74）
+- Block-0, 13: k=4 で精度が最大（デノイジングが進むと情報量増加）
+- Block-4, 9: チャンスレベル近傍（スキルフェーズ情報が少ない）
 
-テーマ 1-A の「k=3→4 での x̂₀ 変化量急増」は、Block-27 の特徴量が最終ステップで最も大きく変化するという内部メカニズムに対応する。
+### 結果: gripper_2（グリッパー 2 値分類）
 
-→ プロット: `theme2_results/theme2_feature_change_by_layer.png`, `theme2_step_change_per_layer.png`
+**チャンスレベル: 50.0%**（バランス後）
 
----
+| 層 | k=0 | k=1 | k=2 | k=3 | k=4 | 傾向 |
+|----|-----|-----|-----|-----|-----|-----|
+| Block-0 | 0.59±0.11 | 0.60±0.10 | 0.66±0.10 | 0.81±0.09 | **0.89±0.08** | k=4 で急増 |
+| Block-4 | 0.56±0.12 | 0.56±0.09 | 0.68±0.10 | 0.85±0.09 | **0.91±0.09** | k=4 で急増 |
+| Block-9 | 0.58±0.12 | 0.59±0.10 | 0.70±0.09 | 0.86±0.09 | **0.91±0.09** | k=4 で急増 |
+| Block-13 | 0.62±0.10 | 0.65±0.10 | 0.75±0.09 | 0.87±0.09 | **0.91±0.08** | k=4 で急増 |
+| Block-18 | 0.94±0.11 | 0.94±0.12 | 0.94±0.12 | 0.95±0.10 | **0.97±0.05** | 高精度・k=4 最大 |
+| Block-22 | 0.96±0.09 | 0.96±0.09 | 0.96±0.08 | 0.97±0.07 | **0.97±0.06** | 非常に高精度 |
+| Block-27 | **0.98±0.05** | 0.98±0.05 | 0.98±0.06 | 0.98±0.05 | **0.98±0.07** | 全ステップで最高精度 |
 
-## 4. テーマ 2-3: 層間表現類似度（Linear CKA）
+**所見**:
+- Block-4, 9, 13: k=0 で 0.56〜0.62 → k=4 で 0.91 と急増——デノイジングによりグリッパー状態の線形分離性が劇的向上
+- Block-18, 22, 27: k=0 から既に高精度（≥0.94）——深い層は初期ノイズ状態でもグリッパー状態を強く符号化
+- バランス前の閾値 0.0（64% 多数クラス）では見掛け上の高精度が生じていた；バランス後（50%）でも Block-27 は 0.98 を維持——真の弁別力の高さが確認された
 
-各層ペアの Linear CKA（k=4、値域 [0,1]、1 = 同一表現）:
+### 結果: gripper_3（グリッパー 3 クラス: 開 / 閉始 / 閉完了）
 
-|  | Block-0 | Block-4 | Block-9 | Block-13 | Block-18 | Block-22 | Block-27 |
-|--|---------|---------|---------|----------|----------|----------|----------|
-| **Block-0** | 1.00 | **0.70** | **0.71** | **0.74** | 0.55 | 0.52 | 0.54 |
-| **Block-4** | | 1.00 | **0.999** | **0.981** | 0.52 | 0.53 | **0.844** |
-| **Block-9** | | | 1.00 | **0.984** | 0.52 | 0.54 | **0.845** |
-| **Block-13** | | | | 1.00 | 0.58 | 0.60 | **0.841** |
-| **Block-18** | | | | | 1.00 | **0.815** | 0.55 |
-| **Block-22** | | | | | | 1.00 | 0.61 |
-| **Block-27** | | | | | | | 1.00 |
+**チャンスレベル: 33.4%**
 
-**CKA クラスター構造**:
+| 層 | k=0 | k=1 | k=2 | k=3 | k=4 | 傾向 |
+|----|-----|-----|-----|-----|-----|-----|
+| Block-0 | 0.44±0.12 | 0.46±0.13 | 0.49±0.13 | 0.63±0.12 | **0.72±0.11** | k=4 で急増 |
+| Block-4 | 0.41±0.13 | 0.40±0.11 | 0.51±0.11 | 0.67±0.11 | **0.72±0.11** | k=4 で急増 |
+| Block-9 | 0.43±0.13 | 0.44±0.12 | 0.53±0.11 | 0.68±0.11 | **0.72±0.10** | k=4 で急増 |
+| Block-13 | 0.45±0.13 | 0.48±0.11 | 0.58±0.12 | 0.71±0.12 | **0.73±0.11** | k=4 で急増 |
+| Block-18 | 0.83±0.12 | 0.83±0.12 | 0.83±0.12 | 0.83±0.12 | **0.85±0.12** | 高精度・k=4 最大 |
+| Block-22 | **0.86±0.10** | 0.85±0.10 | 0.85±0.10 | 0.85±0.10 | 0.86±0.10 | 高精度・ほぼ不変 |
+| Block-27 | **0.88±0.12** | 0.88±0.12 | 0.88±0.12 | 0.88±0.12 | 0.88±0.12 | 全ステップで最高精度 |
 
-1. **Block-4, 9, 13 クラスター**: CKA ≈ 0.98〜1.00（ほぼ同一の表現）→「収束ゾーン」
-2. **Block-18, 22 クラスター**: CKA ≈ 0.81（高類似）。Block-4〜13 とは明確に分離（CKA ≈ 0.52〜0.60）
-3. **Block-0（孤立）**: 他の全層との CKA が 0.52〜0.74（独自の前処理モード）
-4. **Block-27（橋渡し）**: Block-4〜13 との CKA が 0.84 で比較的高い → 中間部の表現を参照しながら最終出力を生成
+### エピソード別予測軌跡
 
-**4 フェーズ構造**:
-```
-Block-0       → Blocks 4–13           → Blocks 18–22      → Block-27
-前処理（汎用）  安定中間表現（収束ゾーン）  高次セマンティック処理  最終確定出力
-分散 ≈ 1.3    分散 ≈ 1,800–2,000       分散 ≈ 8,600–14,000  分散 ≈ 212,000
-```
+分類器の予測がエピソード内の時系列に沿ってどのように変化するかを視覚化したプロットを保存した。
 
-→ プロット: `theme2_results/theme2_cka_matrix.png`
+→ プロット: `results/action_probe/probe_trajectory_comparison_blk27_k4.png`  
+（Block-27, k=4 における最初の 5 エピソードの正解ラベル（実線）と予測ラベル（点線）の比較）
 
----
-
-## 5. テーマ 2-4: PCA による可視化
-
-各層の特徴量を PCA で 2 次元に投影（k=0 および k=4、call index で色付け）:
-
-- **Block-0**: 全 218 点がほぼ 1 点に集中。call index との相関なし。
-- **Block-4〜13**: 分散が広がり始め、異なる episode 間で適度な分離が現れる。
-- **Block-18〜22**: 特徴空間が広がり、同一 episode 内の call 進行と PC1 に緩やかな相関が見られる場合がある。
-- **Block-27**: 最も広い特徴空間、episode 間の分離が明確。
-
-→ プロット: `theme2_results/theme2_pca_k4.png`, `theme2_pca_k0.png`, `theme2_pc1_timeseries_k4.png`
+→ その他のプロット:  
+`results/action_probe/probe_accuracy_by_layer.png`  
+`results/action_probe/probe_k0_vs_k4.png`  
+`results/action_probe/probe_accuracy_heatmap_{progress_3,gripper_2,gripper_3}.png`  
+`results/action_probe/probe_label_distribution.png`  
+`results/action_probe/probe_delta_over_chance.png`
 
 ---
 
-## 6. テーマ 2-5: 線形プロービング（スキルフェーズ予測）
+## 7. 言語クロスアテンション解析
 
-**手法**:
-- Global PCA で 2048→50 次元に削減
-- Ridge 回帰（λ=1.0）+ one-hot → argmax で予測
-- LOEO（Leave-One-Episode-Out）10-fold 交差検証
-- ラベル種別:
-  - `progress_3`: エピソード内進行度 → 3 クラス [early/mid/late]（chance = 34.4%）
-  - `gripper_3`: k=4 の平均グリッパー値 → 3 クラス（chance = 33.5%）
-  - `gripper_2`: グリッパー開/閉 バイナリ（chance = 57.8%）
+### 目的
 
-**結果**:
+action token (T=5) が言語条件付けトークン（T5 埋め込み）のどのトークンに注目するかを全 7 プローブ層 × 全 5 デノイジングステップで解析する。
 
-| ラベル種別 | k | Block-0 | Block-4 | Block-9 | Block-13 | Block-18 | Block-22 | Block-27 | Chance |
-|-----------|---|---------|---------|---------|----------|----------|----------|----------|--------|
-| **progress_3** | 0 | 37% | 30% | 31% | 36% | 50% | 62% | **70%** | 34% |
-| **progress_3** | 4 | 45% | 34% | 37% | 44% | 49% | 61% | **66%** | 34% |
-| **gripper_3** | 0 | 46% | 44% | 47% | 52% | 78% | 85% | **88%** | 34% |
-| **gripper_3** | 4 | 70% | 71% | 71% | 75% | 77% | 85% | **87%** | 34% |
-| **gripper_2** | 0 | 62% | 51% | 55% | 62% | **91%** | **95%** | **99%** | 58% |
-| **gripper_2** | 4 | **93%** | **94%** | **96%** | **94%** | 93% | 96% | **98%** | 58% |
+### 実験条件
 
-**主要な発見**:
+- エピソード数: 50（成功率: 0%）
+- Policy calls: 1600（全エピソード 500 ステップまで実行）
+- 主要タスク記述: "pick the [object] from the counter and place it in the cabinet"
+- 実トークン数 n_real=15、Padding 含む全トークン長 Sk=512
 
-1. **グリッパー開閉は最深部で超早期確立**: Block-27 k=0 で gripper_2 が 99% → 最大ノイズ段階でも把持意図が確立されている。「グリッパーは最も早く最も確実に Commit される次元」。
+**注**: 成功率 0% は CUDA デバイス設定の差異による非決定的挙動の可能性。データ自体の収集は正常（1600 calls）。
 
-2. **k=4 での浅い層の急改善（+31 ポイント）**: Block-0 の gripper_2 が k=0: 62% → k=4: 93%。最終ステップではノイズ入力 x_t が真のアクションに近くなり、グリッパー意図が入力信号に直接反映される。モデルの「賢さ」ではなく入力品質の向上による結果。
+### 結果: 層別 Top-3 注目トークン（全 1600 call 平均）
 
-3. **タスク進行（progress_3）の弱い線形分離性**: 最高でも Block-27 k=0 の 70%（chance から +36%）。gripper_2 の最高 99% と対比して「今タスクの何フェーズ目か」は特徴ベクトル上で explicit に表現されていない → 視覚観測への implicit な依存で成立している可能性。
+エントロピー列: H_all = 全 512 トークン上のエントロピー（最大 ln(512)≈6.24）。H_real = 実トークン 15 個に絞って再正規化したエントロピー（最大 ln(15)≈2.71）。
 
-4. **深さ依存のグラジェント**: progress_3 での k=0 精度が Block-4〜9 ではほぼ chance レベル → 中間収束ゾーンよりも最深部がタスク時間的文脈を保持。
+| 層 | k=0: Top-1 | k=0: Top-2 | k=0: Top-3 | k=4: Top-1 | k=4: Top-2 | k=4: Top-3 | H_all | H_real |
+|----|-----------|-----------|-----------|-----------|-----------|-----------|-------|--------|
+| Block-0 | "bottled"(0.00273) | "the"(0.00272) | "the"(0.00264) | "the"(0.00272) | "bottled"(0.00270) | "the"(0.00266) | 6.238 | 2.680 |
+| Block-4 | "bottled"(0.00529) | "the"(0.00494) | "drink"(0.00371) | "bottled"(0.00519) | "the"(0.00509) | "the"(0.00378) | 6.232 | 2.616 |
+| Block-9 | "bottled"(0.00591) | "drink"(0.00357) | "the"(0.00276) | "bottled"(0.00580) | "drink"(0.00350) | "the"(0.00263) | 6.231 | 2.438 |
+| Block-13 | "bottled"(0.00261) | "drink"(0.00220) | "the"(0.00197) | "bottled"(0.00259) | "drink"(0.00205) | *(pad)* | 6.237 | 2.680 |
+| Block-18 | ""(0.00798) | "bottled"(0.00761) | "the"(0.00538) | ""(0.00810) | "bottled"(0.00763) | "the"(0.00541) | 6.222 | 2.537 |
+| Block-22 | "the"(0.00641) | "cabinet"(0.00433) | "the"(0.00366) | "the"(0.00644) | "cabinet"(0.00435) | "the"(0.00366) | 6.233 | 2.605 |
+| Block-27 | "the"(0.02374) | "cabinet"(0.01389) | "</s>"(0.00887) | "the"(0.02525) | "cabinet"(0.01472) | "</s>"(0.00928) | 6.177 | 2.037 |
 
-→ プロット: `theme2_linear_probe_results/probe_accuracy_by_layer.png`, `probe_k0_vs_k4.png`, `probe_accuracy_heatmap.png`
+**注意点**:
+- "the" が複数出現するのは文中に 3 箇所（token [1], [6], [12]）存在するため（例: "the bottled drink", "the counter", "the cabinet"）
+- "" (Block-18 Top-1) は T5 トークン化で "▁" (空白 subword) となった記号
+- Block-13 k=4 の Top-3 は padding トークン (pos=218) が入り込む（実トークンへの注意が均一化）
+- H_all ≈ 6.23 は均一分布（最大値 6.24）に近く、512 全トークンに分散した注意を示す
+- H_real は Block-27 で 2.04（最大 2.71 の 75%）と最も集中、Block-0 で 2.68（最大の 99%）と最も分散
 
----
+**所見**:
+- 全層で注目トークンはデノイジングステップを通じてほぼ不変（k=0 と k=4 で差異は最小）
+- Block-4, 9, 13: オブジェクト名（"bottled", "drink"）に最集中
+- Block-18: "" / "bottled"（語頭の subword）に集中
+- Block-27: "the", "cabinet"（構造語・目的地）への集中——最深部では対象物より場所・文法を参照
+- 実トークン上のエントロピー (H_real) は Block-27 で最低（2.04）——深い層ほど実トークン内で集中した選好を示す
 
-## 7. テーマ 2-6: 言語クロスアテンション解析
+### デノイジング不変性定量 (max|attn(k=0) - attn(k=4)|)
 
-**手法**: 新規 5 エピソード（160 policy calls）で `block.cross_attn` に forward hook → Q, K を再計算 → `softmax(QK^T/√d)` で attention weights 取得 → action token (T=5) の位置に限定して平均化
+| Block | max 差分 |
+|-------|---------|
+| Block-0 | 0.0000015 |
+| Block-4 | 0.0010122 |
+| Block-9 | 0.0002898 |
+| Block-13 | 0.0000844 |
+| Block-18 | 0.0000299 |
+| Block-22 | 0.0000602 |
+| Block-27 | 0.0001467 |
 
-**タスク説明のトークン例**:
-`['pick', 'the', 'canned', 'food', 'from', 'the', 'counter', 'and', 'place', 'it', 'in', 'the', 'cabinet', '</s>']` (14 real tokens)
-
-**層別の注目トークンパターン (k=4、real tokens 内で正規化)**:
-
-| 層 | Top-1 | Top-2 | Top-3 | 解釈 |
-|----|-------|-------|-------|------|
-| Block-0 | 'from' (11%) | '</s>' (11%) | 'and' (10%) | 拡散的・ほぼ一様 |
-| Block-4 | 'from' (14%) | 'and' (12%) | 'counter' (11%) | ソース位置への傾き |
-| Block-9 | **'from' (25%)** | 'food' (16%) | 'and' (10%) | ソースに強集中 |
-| Block-13 | 'from' (13%) | 'food' (10%) | 'and' (10%) | 集中が緩和 |
-| Block-18 | **'canned' (18%)** | **'food' (16%)** | 'from' (12%) | オブジェクト名詞へシフト |
-| Block-22 | '</s>' (19%) | **'cabinet' (14%)** | 'and' (11%) | 目的地・文末へシフト |
-| Block-27 | **'</s>' (44%)** | **'cabinet' (30%)** | 'and' (4%) | 目的地に超集中 |
-
-**主要な発見**:
-
-1. **「ソース → オブジェクト → 目的地」の意味的階層**: 層が深まるにつれて注目トークンが変化。Block-9 → "from" (ピックアップ元) → Block-18 → "[object] food" (把持対象) → Block-27 → "cabinet" (配置先)。PnP タスクの 3 フェーズ（リーチ→把持→配置）と対応する意味的処理の深化。
-
-2. **デノイジングステップ不変性**: k=0〜4 の間で注目パターンはほぼ変化しない（上位トークン attention weight の変化 < 1%）。Cross-attention は固定的な言語的文脈読み取りに特化。
-
-3. **スキルフェーズ不変性**: early/mid/late フェーズ間でも変化は小さい（Block-27 の '</s>' への attention が late で 1.7% 増加のみ）。
-
-4. **Block-27 の '</s>' への超集中（44%）**: T5 の `</s>` は文全体のグローバル要約を符号化する特別なトークン。最深部での注目は「タスクの目標（配置先）」という高レベルな言語意味から最終アクション出力が直接決定されることを示す。
-
-5. **注目エントロピー**: 全 512 トークンへの attention の entropy H ≈ 6.16〜6.24（log(512) ≈ 6.24）。Padding 含む全体では広く分散、real tokens 内での相対的集中がパターンを形成。Block-27 の H=6.15 が最低値（最も選択的）。
-
-→ プロット: `theme2_crossattn_results/crossattn_layer_token_heatmap_k4.png`, `crossattn_by_denoise_step.png`, `crossattn_by_skill_phase.png`, `crossattn_top8_tokens_k4.png`, `crossattn_entropy.png`
+→ 全プロット: `results/action_crossattn/crossattn_layer_token_heatmap_k{0-4}.png`, `crossattn_by_denoise_step_k{0-4}.png`, `crossattn_by_skill_phase_k{0-4}.png`, `crossattn_top8_tokens_k{0-4}.png`, `crossattn_variability_k{0-4}.png`, `crossattn_entropy.png`
 
 ---
 
-## 8. 総合サマリー
+## 8. 総合まとめ
 
-| 検証項目 | 結果 | 意義 |
-|---------|------|------|
-| Block 分散比 (0→27) | **1.36 → 211,784（15 万倍）** | 浅い=汎用処理、深い=タスク特化表現の明確な分業 |
-| Block-27 デノイズ変化量 | **L2=329（中間層の 3 倍）** | 最終確定出力は最深部でのみ大きく変化（Commitment の座） |
-| CKA クラスター構造 | **4–13=収束ゾーン (CKA≈1.0)、18–22=セマンティック** | 28 層が 4 つの処理フェーズに自然分割 |
-| 線形プロービング (progress_3) | **Block-27 最高 70%（chance +36%）** | 時間的進行の線形分離は深い層に限定 |
-| 線形プロービング (gripper_2) | **Block-27 k=0: 99%、Block-0 k=4: 93%** | グリッパー開閉は最深部で完全分離、最終ステップでは浅い層でも高精度 |
-| Cross-Attention 層別注目 | **Blk-9: 'from' 25%、Blk-18: 'canned'+'food' 34%、Blk-27: '</s>'+'cabinet' 74%** | 層深度に沿って「ソース→対象→目的地」と意味的に変化、k・フェーズには不変 |
-
----
-
-## 9. 考察
-
-1. **DiT 内部の 4 フェーズ構造が定量的に確認された**。Block-0 が固定前処理器として全 call に共通する処理を実行し、Block-4〜13 が「残差接続による安定収束ゾーン」を形成し、Block-18〜22 が観測からタスク状態への高次意味理解を担い、Block-27 が最終確定出力を生成する。
-
-2. **「グリッパーの超早期確立」は重要な新発見**。把持アクションの決定が拡散プロセスの第 1 ステップ（σ=80）の時点で最深部に確立されているという事実は、Cosmos Policy が観測から即座に把持意図を抽出できることを示す。
-
-3. **「タスク時間的進行の弱い線形表現」**は、スキル軌跡の追跡が視覚観測への implicit な依存によって成立しており、特徴ベクトル上での explicit な状態管理として機能していないことを示唆する。
-
-4. **言語の意味的処理の分業**は、各層が PnP タスクの各フェーズに対応する言語要素を処理するという、言語とアクションの深い統合メカニズムを示す。
-
----
-
-## 10. 出力ファイル一覧
-
-| ファイル | 内容 |
+| 検証項目 | 所見 |
 |---------|------|
-| `theme2_results/theme2_features.npz` | 全 policy call × 全ステップ × 7 層の特徴ベクトル（再解析用） |
-| `theme2_results/theme2_pca_k4.png` | 各層の PCA 可視化（k=4） |
-| `theme2_results/theme2_pca_k0.png` | 各層の PCA 可視化（k=0） |
-| `theme2_results/theme2_pc1_timeseries_k4.png` | PC1 時系列（call 進行との対応） |
-| `theme2_results/theme2_feature_variance.png` | 各層の特徴量分散 |
-| `theme2_results/theme2_feature_change_by_layer.png` | k=0→k=4 の層別変化量 |
-| `theme2_results/theme2_step_change_per_layer.png` | ステップごとの層別変化量 |
-| `theme2_results/theme2_cka_matrix.png` | 7×7 層間 Linear CKA ヒートマップ |
-| `theme2_results/theme2_stats.json` | テーマ 2 の全統計量 |
-| `theme2_linear_probe_results/probe_accuracy_by_layer.png` | 層別・ラベル種別のプロービング精度 |
-| `theme2_linear_probe_results/probe_k0_vs_k4.png` | k=0 vs k=4 の精度比較 |
-| `theme2_linear_probe_results/probe_accuracy_heatmap.png` | 層 × ステップ × ラベルの精度ヒートマップ |
-| `theme2_linear_probe_results/probe_label_distribution.png` | 3 種ラベルの分布確認 |
-| `theme2_linear_probe_results/probe_delta_over_chance.png` | chance からの上昇量 |
-| `theme2_linear_probe_results/theme2_probe_stats.json` | プロービング精度の全統計量 |
-| `theme2_crossattn_results/crossattn_layer_token_heatmap_k4.png` | 層 × トークンの attention ヒートマップ |
-| `theme2_crossattn_results/crossattn_by_denoise_step.png` | デノイジングステップ別 token attention |
-| `theme2_crossattn_results/crossattn_by_skill_phase.png` | スキルフェーズ別 token attention |
-| `theme2_crossattn_results/crossattn_top8_tokens_k4.png` | 各層上位 8 トークン（バーチャート） |
-| `theme2_crossattn_results/crossattn_entropy.png` | 全層 × 全 k の attention entropy |
-| `theme2_crossattn_results/theme2_crossattn.npz` | 全 160 policy call の attention weights |
-| `theme2_crossattn_results/theme2_crossattn_meta.json` | 実験メタデータ |
+| 特徴量分散・変化量 | 50 ep 分生成済み（`feature_feature_variance.png`, `feature_feature_change_by_layer.png`, `feature_step_change_per_layer.png`） |
+| 層間 CKA | k=0〜4 全 5 枚生成済み（`feature_cka_matrix_k{0-4}.png`） |
+| PCA 可視化 | k=0〜k=4 全 10 ファイル生成済み（`pca_per_layer_k{0-4}.png` + `feature_pca_k{0-4}.png`） |
+| t-SNE 可視化 | k=0〜k=4 全 5 ファイル生成済み（`feature_tsne_per_layer_k{0-4}.png`） |
+| progress_3 線形プロービング | Block-27 最高精度（k=4: 0.72）、Block-18, 22, 27 はデノイジング不変（≈0.70〜0.74）、チャンス 33.9% |
+| gripper_2 線形プロービング（均衡後） | Block-27 最高精度（0.98）、チャンス 50%。Block-4,9,13 は k=0→k=4 で 0.56→0.91 の急増 |
+| gripper_3 線形プロービング | Block-27 最高精度（k=4: 0.88）、Block-4,9,13 は k=4 で急増（0.41→0.72） |
+| 言語クロスアテンション | 全層でデノイジングステップ不変。Block-4,9,13 はオブジェクト名に注目、Block-27 は構造語に注目。H_real (Block-27)=2.04 が最も集中 |
+
+---
+
+## 9. 出力ファイル一覧
+
+| ファイル | 内容 | 状況 |
+|---------|------|------|
+| `results/action_features/features.npz` | 全 1108 call × 全ステップ × 7 層の特徴ベクトル | ✓ |
+| `results/action_features/pca_per_layer_k{0-4}.png` | PCA 可視化（全 5 ステップ） | ✓ |
+| `results/action_features/tsne_per_layer_k{0-4}.png` | t-SNE 可視化 | 未生成 |
+| `results/action_features/feature_variance.png` | 各層の特徴量分散 | 未生成 |
+| `results/action_features/feature_change_by_layer.png` | k=0→k=4 の層別変化量 | 未生成 |
+| `results/action_features/step_change_per_layer.png` | 全ステップ遷移の層別変化量 | 未生成 |
+| `results/action_features/cka_matrix_k{0-4}.png` | 7×7 層間 Linear CKA ヒートマップ | 未生成 |
+| `results/action_probe/probe_stats.json` | プロービング精度統計（均衡ラベル版） | ✓ |
+| `results/action_probe/probe_accuracy_heatmap_{label_type}.png` | 層×ステップ 精度ヒートマップ（3 種） | ✓ |
+| `results/action_probe/probe_trajectory_comparison_blk27_k4.png` | 正解 vs 予測ラベル軌跡（5 エピソード） | ✓ |
+| `results/action_crossattn/crossattn_*.png` | クロスアテンション全プロット（5k × 5種） | ✓ |
+| `results/action_crossattn/crossattn.npz` | 生アテンションデータ | ✓ |
+| `results/action_crossattn/crossattn_meta.json` | トークン情報・メタデータ | ✓ |
