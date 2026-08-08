@@ -31,8 +31,8 @@
 |-------------|------|
 | [mechanism_eval.md](analysis/mechanism_eval.md) | 検証計画・手法の提案（オリジナル） |
 | [mechanism_eval_results.md](analysis/mechanism_eval_results.md) | 検証結果インデックス・主要発見サマリー |
-| [results_01_action_denoising.md](analysis/results_01_action_denoising.md) | **テーマ1 (アクション)**: デノイジング過程の解析、層別再検証 |
-| [results_02_action_features.md](analysis/results_02_action_features.md) | **テーマ2 (アクション)**: DiT 中間特徴量・線形プロービング・言語クロスアテンション |
+| [results_01_action_denoising.md](analysis/results_01_action_denoising.md) | **デノイジング過程 (アクション)**: x̂₀ 変化量・FFT・スコアノルム・層別特徴量解析 |
+| [results_02_action_features.md](analysis/results_02_action_features.md) | **特徴量解析 (アクション)**: DiT 中間特徴量・線形プロービング・言語クロスアテンション |
 | [results_03_image_generation.md](analysis/results_03_image_generation.md) | **画像生成**: 将来画像ラテント解析、アクションとの比較 |
 | [results_04_self_attention.md](analysis/results_04_self_attention.md) | **自己注意**: 入力画像・proprio への注意パターン解析 |
 
@@ -80,21 +80,30 @@ Block-9: "from"（ソース位置）→ Block-18: "[object] food"（把持対象
 | スクリプト | 内容 |
 |-----------|------|
 | `analysis_shared.py` | **共通定数・ユーティリティ**（全スクリプト共有） |
-| `mechanism_analysis.py` | テーマ1: アクションのデノイジング解析 |
-| `theme2_analysis.py` | テーマ2: DiT 特徴量収集 |
-| `theme1_layer_analysis.py` | テーマ1 層別: 既存特徴量 npz から再解析 |
-| `theme2_linear_probe.py` | テーマ2: 線形プロービング |
-| `theme2_crossattn.py` | テーマ2: 言語クロスアテンション解析 |
-| `theme2_plot.py` | テーマ2: 特徴量の可視化ユーティリティ |
-| `theme_image_analysis.py` | 画像生成解析（テーマ1・2の画像版） |
-| `theme_attention_analysis.py` | 自己注意解析（全モダリティ） |
+| `mechanism_analysis.py` | アクションのデノイジング解析（x̂₀ 変化量・FFT・スコアノルム） |
+| `feature_analysis.py` | DiT 特徴量収集（全 7 層 × 全 5 ステップ） |
+| `layer_analysis.py` | 層別解析: 既存特徴量 npz から変化量・有効ランク・ノルムを再解析 |
+| `linear_probe.py` | 線形プロービング（クラス均衡ラベル × 層 × ステップ） |
+| `crossattn_analysis.py` | 言語クロスアテンション解析（real-token entropy 含む） |
+| `feature_plot.py` | 特徴量の可視化ユーティリティ |
+| `feature_replot.py` | 既存 features.npz からプロットのみ再実行 |
+| `crossattn_replot.py` | 既存 crossattn.npz から全プロット（H_real 含む）を再生成 |
+| `attention_replot.py` | 既存 t_matrices.npy から Attention Rollout を計算・プロット |
+| `image_analysis.py` | 画像生成解析（ラテント変化量・CKA・線形プロービング） |
+| `attention_analysis.py` | 自己注意解析（全モダリティ・Attention Rollout 含む） |
 
-実行スクリプト（Singularity + EGL 設定込み、リポジトリルートに配置）:
+実行スクリプト（リポジトリルートに配置）:
 
-| スクリプト | 対応解析 |
-|-----------|---------|
-| `run_image_analysis.sh` | `analysis/theme_image_analysis.py` |
-| `run_attention_analysis.sh` | `analysis/theme_attention_analysis.py` |
+| スクリプト | 対応解析 | 備考 |
+|-----------|---------|------|
+| `run_mechanism_analysis.sh` | `mechanism_analysis.py` | Singularity + EGL |
+| `run_feature_analysis.sh` | `feature_analysis.py` | Singularity + EGL |
+| `run_crossattn_analysis.sh` | `crossattn_analysis.py` | Singularity + EGL |
+| `run_attention_analysis.sh` | `attention_analysis.py` | Singularity + EGL |
+| `run_image_analysis.sh` | `image_analysis.py` | Singularity + EGL |
+| `run_offline_analysis.sh` | `layer_analysis.py` + `linear_probe.py` + `dimension_analysis.py` | オフライン（GPU不要） |
+| `run_feature_replot.sh` | `feature_replot.py` | オフライン（プロット再実行） |
+| `run_all_analysis_host.sh` | 上記全スクリプトを順次実行 | ホスト側マスタースクリプト |
 
 ## 結果ディレクトリ
 
@@ -102,9 +111,9 @@ Block-9: "from"（ソース位置）→ Block-18: "[object] food"（把持対象
 
 | ディレクトリ | 内容 |
 |------------|------|
-| `action_denoising/` | テーマ1 アクション解析の PNG・JSON・NPZ |
-| `action_layer/` | テーマ1 層別解析の PNG・JSON |
-| `action_features/` | テーマ2 特徴量 PCA・CKA・分散の PNG・NPZ |
+| `action_denoising/` | アクションのデノイジング解析の PNG・JSON・NPZ |
+| `action_layer/` | 層別特徴量解析の PNG・JSON |
+| `action_features/` | DiT 特徴量 PCA・CKA・分散の PNG・NPZ |
 | `action_probe/` | 線形プロービング精度の PNG・JSON |
 | `action_crossattn/` | 言語クロスアテンションの PNG・JSON・NPZ |
 | `image_generation/` | 画像生成解析の PNG・JSON |

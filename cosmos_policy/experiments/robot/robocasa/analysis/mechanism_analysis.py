@@ -1,11 +1,10 @@
 """
 Cosmos Policy 拡散モデルのメカニズム解析スクリプト
-mechanism_eval.md の検証計画に基づく実装
 
-【テーマ1】デノイジング過程の解析
-  1-A. 各ステップの予測軌跡 (x_hat_0) の変化と定量化
-  1-B. 周波数領域（FFT）解析
-  1-C. スコア関数（ノイズ予測）のノルム解析
+デノイジング過程の解析:
+  A. 各ステップの予測軌跡 (x_hat_0) の変化と定量化
+  B. 周波数領域（FFT）解析
+  C. スコア関数（ノイズ予測）のノルム解析
 
 実行方法（Singularity コンテナ内で）:
   python -m cosmos_policy.experiments.robot.robocasa.mechanism_analysis \
@@ -169,7 +168,6 @@ def get_action_with_capture(
 
 def compute_per_step_stats(all_records: List[List[Dict]], chunk_size: int = CHUNK_SIZE):
     """
-    全 policy call の各デノイジングステップの統計を計算する。
     Returns:
         step_actions: {step_idx: list of (chunk_size, ACTION_DIM)}
         step_norms: {step_idx: list of noise_pred_norm}
@@ -204,8 +202,33 @@ def compute_per_step_stats(all_records: List[List[Dict]], chunk_size: int = CHUN
     return step_actions, step_norms, step_sigmas, step_fft_low, step_fft_high
 
 
+def compute_action_alignment(
+    all_records: List[List[Dict]],
+    call_meta: List[Dict],
+    chunk_size: int = CHUNK_SIZE,
+):
+    """
+    compute_per_step_stats の step_actions と同じフィルタ条件
+    （act is not None のときだけ採用）で、各 step_actions[step_idx] の
+    各要素がどの (episode, call_idx_in_ep) 由来かを並行して追跡する。
+    再解析（成功epのみへのフィルタ・LOEO等）に必須のメタデータ。
+    """
+    step_episode_labels = defaultdict(list)
+    step_call_idx_labels = defaultdict(list)
+
+    for meta, ep_records in zip(call_meta, all_records):
+        for step_idx, rec in enumerate(ep_records):
+            act = extract_action_from_x0(rec["x0_latent"], chunk_size)
+            if act is not None:
+                step_episode_labels[step_idx].append(meta["episode"])
+                step_call_idx_labels[step_idx].append(meta["call_idx"])
+
+    return step_episode_labels, step_call_idx_labels
+
+
 def compute_prediction_deltas(all_records: List[List[Dict]], chunk_size: int = CHUNK_SIZE):
-    """連続するステップ間の予測変化量 ||x̂₀(k) - x̂₀(k-1)||₂ を計算"""
+    """
+    """
     transition_deltas = defaultdict(list)  # (step_i-1 -> step_i) -> list of L2 norms
 
     for ep_records in all_records:
@@ -248,7 +271,7 @@ def plot_trajectory_overlay(step_actions, out_dir, task_name, success_rate, sort
     if D == 1:
         axes = [axes]
     fig.suptitle(
-        f"Theme 1-A Extension: Trajectory Overlay\n"
+        f"x̂₀ Prediction Trajectory Overlay\n"
         f"Dashed = k={k_first} (σ≈{sigma_first:.1f})  Solid = k={k_last} (σ≈{sigma_last:.1f})\n"
         f"Task: {task_name}  Success: {success_rate:.1%}  N={N} samples",
         fontsize=10,
@@ -277,7 +300,7 @@ def plot_trajectory_overlay(step_actions, out_dir, task_name, success_rate, sort
 
     axes[-1].set_xlabel("Action chunk timestep (0 to chunk_size-1)")
     plt.tight_layout()
-    path = out_dir / "theme1a_trajectory_overlay.png"
+    path = out_dir / "denoising_x0_overlay.png"
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     log_message(f"Saved: {path}")
@@ -327,7 +350,7 @@ def plot_phase_analysis(step_actions, out_dir, task_name, success_rate, sorted_s
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(
-        f"Theme 1-B Extension: FFT Phase Analysis\n"
+        f"FFT Phase Analysis\n"
         f"k={k_first} (σ≈{sigma_first:.1f})  vs  k={k_last} (σ≈{sigma_last:.1f})  |  "
         f"Task: {task_name}  Success: {success_rate:.1%}",
         fontsize=10,
@@ -369,7 +392,7 @@ def plot_phase_analysis(step_actions, out_dir, task_name, success_rate, sorted_s
     axes[2].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    path = out_dir / "theme1b_phase_analysis.png"
+    path = out_dir / "fft_phase_analysis.png"
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     log_message(f"Saved: {path}")
@@ -383,7 +406,8 @@ def plot_phase_analysis(step_actions, out_dir, task_name, success_rate, sorted_s
 
 # ── プロット ───────────────────────────────────────────────────────────────
 
-def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, chunk_size: int = CHUNK_SIZE):
+def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, chunk_size: int = CHUNK_SIZE,
+             call_meta: Optional[List[Dict]] = None, episode_success: Optional[Dict[int, bool]] = None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     step_actions, step_norms, step_sigmas, step_fft_low, step_fft_high = compute_per_step_stats(all_records, chunk_size)
@@ -394,10 +418,10 @@ def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, ch
     std_norms = [np.std(step_norms[s]) for s in sorted_steps]
     mean_sigmas = [np.mean(step_sigmas[s]) for s in sorted_steps]
 
-    # ── Figure 1: デノイジング軌跡 (Theme 1-A) ──────────────────────────
+    # ── Figure 1: デノイジング軌跡 ──────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle(
-        f"Theme 1-A: x̂₀ Prediction Trajectory\nTask: {task_name}  Success: {success_rate:.1%}  "
+        f"x̂₀ Prediction Trajectory\nTask: {task_name}  Success: {success_rate:.1%}  "
         f"({len(all_records)} policy calls)",
         fontsize=12,
     )
@@ -430,12 +454,12 @@ def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, ch
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    path_1a = out_dir / "theme1a_denoising_trajectory.png"
+    path_1a = out_dir / "denoising_x0_change.png"
     plt.savefig(path_1a, dpi=150, bbox_inches="tight")
     plt.close()
     log_message(f"Saved: {path_1a}")
 
-    # ── Figure 2: FFT 解析 (Theme 1-B) ──────────────────────────────────
+    # ── Figure 2: FFT 解析 ───────────────────────────────────────────────
     if step_fft_low:
         fig, ax = plt.subplots(figsize=(10, 5))
         low_means = [np.mean(step_fft_low[s]) for s in sorted_steps]
@@ -445,13 +469,13 @@ def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, ch
         ax.set_xlabel("Denoising step index (0 = highest noise)")
         ax.set_ylabel("Mean FFT magnitude")
         ax.set_title(
-            f"Theme 1-B: Spectral Analysis across Denoising Steps\n"
+            f"Spectral Analysis across Denoising Steps\n"
             f"Task: {task_name}  Success: {success_rate:.1%}"
         )
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        path_1b = out_dir / "theme1b_fft_analysis.png"
+        path_1b = out_dir / "fft_analysis.png"
         plt.savefig(path_1b, dpi=150, bbox_inches="tight")
         plt.close()
         log_message(f"Saved: {path_1b}")
@@ -463,15 +487,50 @@ def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, ch
     plot_phase_analysis(step_actions, out_dir, task_name, success_rate, sorted_steps, mean_sigmas)
 
     # ── step_actions を npz 保存（再解析用） ─────────────────────────────
+    # episode_labels_k{k}/call_idx_labels_k{k}: 各 step_actions[k][i] がどの
+    # (episode, call_idx_in_ep) 由来かを示す（成功epフィルタ・LOEO等に必須）。
     npz_data = {str(k): np.stack(v) for k, v in step_actions.items() if v}
+    if call_meta is not None:
+        step_episode_labels, step_call_idx_labels = compute_action_alignment(
+            all_records, call_meta, chunk_size
+        )
+        for k, v in step_episode_labels.items():
+            if v:
+                npz_data[f"episode_labels_{k}"] = np.array(v)
+        for k, v in step_call_idx_labels.items():
+            if v:
+                npz_data[f"call_idx_labels_{k}"] = np.array(v)
+    if episode_success is not None:
+        ep_success_index = np.array(sorted(episode_success.keys()))
+        ep_success_flag = np.array([bool(episode_success[e]) for e in ep_success_index])
+        npz_data["episode_success_index"] = ep_success_index
+        npz_data["episode_success_flag"] = ep_success_flag
+
+    # §2.4 (noise_pred_norm/F_theta測度集中解析) 用: sigma/noise_pred_normは
+    # act抽出の成否によらず全recordで存在するため、専用のepisode/call_idx
+    # ラベル配列を別途保存する（step_actions由来のepisode_labels_{k}とは
+    # 母集団が異なりうる点に注意）。
+    if call_meta is not None:
+        for step_idx in sorted(step_norms.keys()):
+            eps_this_step, cis_this_step = [], []
+            for meta, ep_records in zip(call_meta, all_records):
+                if step_idx < len(ep_records):
+                    eps_this_step.append(meta["episode"])
+                    cis_this_step.append(meta["call_idx"])
+            if len(eps_this_step) == len(step_norms[step_idx]):
+                npz_data[f"norm_{step_idx}"] = np.array(step_norms[step_idx], dtype=np.float32)
+                npz_data[f"sigma_{step_idx}"] = np.array(step_sigmas[step_idx], dtype=np.float32)
+                npz_data[f"norm_episode_labels_{step_idx}"] = np.array(eps_this_step)
+                npz_data[f"norm_call_idx_labels_{step_idx}"] = np.array(cis_this_step)
+
     np.savez(out_dir / "step_actions.npz", **npz_data)
     log_message(f"Saved: {out_dir / 'step_actions.npz'}")
 
-    # ── Figure 3: スコア関数ノルム (Theme 1-C) ──────────────────────────
+    # ── Figure 3: スコア関数ノルム ──────────────────────────────────────
     if step_norms:
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         fig.suptitle(
-            f"Theme 1-C: Score Function (Noise Prediction) Norm\n"
+            f"Score Function (Noise Prediction) Norm\n"
             f"Task: {task_name}  Success: {success_rate:.1%}",
             fontsize=12,
         )
@@ -498,7 +557,7 @@ def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, ch
         axes[2].grid(True, alpha=0.3)
 
         plt.tight_layout()
-        path_1c = out_dir / "theme1c_score_norm.png"
+        path_1c = out_dir / "score_norm.png"
         plt.savefig(path_1c, dpi=150, bbox_inches="tight")
         plt.close()
         log_message(f"Saved: {path_1c}")
@@ -561,7 +620,7 @@ def plot_all(all_records, out_dir: Path, task_name: str, success_rate: float, ch
 
 @dataclass
 class MechAnalysisConfig(PolicyEvalConfig):
-    num_analysis_episodes: int = 10
+    num_analysis_episodes: int = 50
     output_dir: str = "cosmos_policy/experiments/robot/robocasa/analysis/results/action_denoising"
     obj_instance_split: Optional[str] = None  # use all available objects (not held-out B-split)
 
@@ -592,7 +651,9 @@ def main():
 
     capture = DenoiseCapture()
     all_denoising_records: List[List[Dict]] = []  # per policy call
+    call_meta: List[Dict] = []  # parallel to all_denoising_records: {"episode", "call_idx"}
     success_count = 0
+    episode_success: Dict[int, bool] = {}
     total_episodes = cfg.num_analysis_episodes
 
     for ep_idx in range(total_episodes):
@@ -611,6 +672,7 @@ def main():
         action_queue = deque()
         success = False
         max_steps = TASK_MAX_STEPS.get(cfg.task_name, 500)
+        call_idx_in_ep = 0
 
         for t in range(max_steps):
             observation = prepare_observation(obs, cfg.flip_images)
@@ -629,6 +691,8 @@ def main():
                     )
                     actions = result["actions"]
                     all_denoising_records.append(list(capture.step_records))
+                    call_meta.append({"episode": ep_idx, "call_idx": call_idx_in_ep})
+                    call_idx_in_ep += 1
                     log_message(
                         f"  t={t}: {len(capture.step_records)} denoising steps captured"
                     )
@@ -651,6 +715,7 @@ def main():
         env.close()
         if success:
             success_count += 1
+        episode_success[ep_idx] = success
         log_message(f"  Result: {'SUCCESS' if success else 'FAIL'}")
 
     success_rate = success_count / total_episodes if total_episodes > 0 else 0.0
@@ -699,7 +764,8 @@ def main():
 
     # ---- Plots ----
     if all_denoising_records:
-        plot_all(all_denoising_records, out_dir, cfg.task_name, success_rate, cfg.chunk_size)
+        plot_all(all_denoising_records, out_dir, cfg.task_name, success_rate, cfg.chunk_size,
+                 call_meta=call_meta, episode_success=episode_success)
 
     log_message("Analysis complete!")
     return stats
