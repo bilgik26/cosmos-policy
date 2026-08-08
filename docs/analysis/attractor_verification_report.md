@@ -7,6 +7,11 @@
 **実行日**: 2026-07-07（以降、追加検証を順次実施）。**リポジトリ**: `/home/bilgehan.sakai/cosmos-policy`。
 **対象モデル**: `nvidia/Cosmos-Policy-RoboCasa-Predict2-2B`（28ブロックDiT、行動条件付き拡散ポリシー）。
 
+> **編集注記（実行後のリファクタリング）**: 本文中のスクリプトパスは実行当時のもの
+> （`cosmos_policy/experiments/robot/robocasa/analysis/*.py`）。その後、実装は
+> `cosmos_policy/experiments/robot/robocasa/analysis/verification/attractor/` へ整理された
+> （詳細: `verification/README.md`）。数値・分析結果は変更していない。
+
 ---
 
 ## 目次

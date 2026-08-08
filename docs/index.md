@@ -75,35 +75,20 @@ Block-9: "from"（ソース位置）→ Block-18: "[object] food"（把持対象
 
 ## 実験コード
 
-検証スクリプトは `cosmos_policy/experiments/robot/robocasa/analysis/` に格納。
+検証スクリプトは `cosmos_policy/experiments/robot/robocasa/analysis/verification/` に
+テーマ別サブパッケージ（`mechanism/`, `representation/`, `attention/`, `attractor/`,
+`latent_dynamics/` 等）として整理されている。各サブパッケージは対応する
+`run_*.sh` 実行スクリプトを同居させている。構成・命名規約・新規検証/可視化の
+追加方法は [`verification/README.md`](../cosmos_policy/experiments/robot/robocasa/analysis/verification/README.md)
+を参照（このファイルが実験コードに関する一次リファレンス）。
 
-| スクリプト | 内容 |
-|-----------|------|
-| `analysis_shared.py` | **共通定数・ユーティリティ**（全スクリプト共有） |
-| `mechanism_analysis.py` | アクションのデノイジング解析（x̂₀ 変化量・FFT・スコアノルム） |
-| `feature_analysis.py` | DiT 特徴量収集（全 7 層 × 全 5 ステップ） |
-| `layer_analysis.py` | 層別解析: 既存特徴量 npz から変化量・有効ランク・ノルムを再解析 |
-| `linear_probe.py` | 線形プロービング（クラス均衡ラベル × 層 × ステップ） |
-| `crossattn_analysis.py` | 言語クロスアテンション解析（real-token entropy 含む） |
-| `feature_plot.py` | 特徴量の可視化ユーティリティ |
-| `feature_replot.py` | 既存 features.npz からプロットのみ再実行 |
-| `crossattn_replot.py` | 既存 crossattn.npz から全プロット（H_real 含む）を再生成 |
-| `attention_replot.py` | 既存 t_matrices.npy から Attention Rollout を計算・プロット |
-| `image_analysis.py` | 画像生成解析（ラテント変化量・CKA・線形プロービング） |
-| `attention_analysis.py` | 自己注意解析（全モダリティ・Attention Rollout 含む） |
+3件の詳細検証レポート:
 
-実行スクリプト（リポジトリルートに配置）:
-
-| スクリプト | 対応解析 | 備考 |
-|-----------|---------|------|
-| `run_mechanism_analysis.sh` | `mechanism_analysis.py` | Singularity + EGL |
-| `run_feature_analysis.sh` | `feature_analysis.py` | Singularity + EGL |
-| `run_crossattn_analysis.sh` | `crossattn_analysis.py` | Singularity + EGL |
-| `run_attention_analysis.sh` | `attention_analysis.py` | Singularity + EGL |
-| `run_image_analysis.sh` | `image_analysis.py` | Singularity + EGL |
-| `run_offline_analysis.sh` | `layer_analysis.py` + `linear_probe.py` + `dimension_analysis.py` | オフライン（GPU不要） |
-| `run_feature_replot.sh` | `feature_replot.py` | オフライン（プロット再実行） |
-| `run_all_analysis_host.sh` | 上記全スクリプトを順次実行 | ホスト側マスタースクリプト |
+| レポート | 対応サブパッケージ |
+|---------|-------------------|
+| [verification_report_v3.md](analysis/verification_report_v3.md) | `collection`, `mechanism`, `representation`, `causal_gates`, `probing`, `attention`, `text_conditioning`, `image_latent`, `sanity` |
+| [attractor_verification_report.md](analysis/attractor_verification_report.md) | `attractor` |
+| [latent_dynamics_verification_report.md](analysis/latent_dynamics_verification_report.md) | `latent_dynamics` |
 
 ## 結果ディレクトリ
 

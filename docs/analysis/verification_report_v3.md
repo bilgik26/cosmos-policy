@@ -21,6 +21,11 @@ PR/CKA/コサインのkステップ推移・fold内標準化PCA+LogisticRegressi
 各該当節冒頭にその理由を明記した。新データの詳細（収集スクリプト・成功率・
 episode数・使用ライブラリ）は §12 に追記した。
 
+> **実装コードの現在地**: 本レポート内のスクリプト名・パスは実行当時のもの（`cosmos_policy/experiments/robot/robocasa/analysis/*.py`）。
+> その後のリファクタリングにより実装は `cosmos_policy/experiments/robot/robocasa/analysis/verification/`
+> 配下のテーマ別サブパッケージへ整理された。対応関係と新規検証の追加方法は
+> [`verification/README.md`](../../cosmos_policy/experiments/robot/robocasa/analysis/verification/README.md) を参照。
+
 ## 0. 本レポートについて
 
 本レポートは、Cosmos Policy（RoboCasaタスク上で行動を生成する拡散ポリシー）の内部機構を、

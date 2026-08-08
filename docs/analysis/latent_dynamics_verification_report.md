@@ -21,6 +21,11 @@
 先行2検証と同じく、**「前提を検証し反証を許す」姿勢**を貫く。実装中に発見したバグは隠さず
 第7節にまとめ、結果は都合の良い部分だけを取り上げず正直に報告する。
 
+> **編集注記（実行後のリファクタリング）**: 本文中のスクリプトパスは実行当時のもの
+> （`cosmos_policy/experiments/robot/robocasa/analysis/*.py`）。その後、実装は
+> `cosmos_policy/experiments/robot/robocasa/analysis/verification/latent_dynamics/` へ整理された
+> （詳細: `verification/README.md`）。数値・分析結果は変更していない。
+
 ---
 
 ## 目次
