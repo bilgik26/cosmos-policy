@@ -8,6 +8,7 @@ This package holds the implementation behind the three verification reports in
 | [`verification_report_v3.md`](../../../../../../docs/analysis/verification_report_v3.md) | `collection`, `mechanism`, `representation`, `causal_gates`, `probing`, `attention`, `text_conditioning`, `image_latent`, `sanity` |
 | [`attractor_verification_report.md`](../../../../../../docs/analysis/attractor_verification_report.md) | `attractor` (+ `common/phase_labeling.py`, `common/analysis_shared.py`) |
 | [`latent_dynamics_verification_report.md`](../../../../../../docs/analysis/latent_dynamics_verification_report.md) | `latent_dynamics` (reuses several `attractor` functions directly) |
+| [`latent_dynamics_verification/report_v3.md`](../../../../../../docs/analysis/latent_dynamics_verification/report_v3.md) | `intervention_v3` (reuses `attractor/collect_multitask.py` output + `common/phase_labeling.py`, `common/v4_stats_lib.py`, and the EDM sampler internals under `cosmos_policy/_src/imaginaire/functional/{multi_step,runge_kutta}.py`) |
 
 Read this file before adding a new verification or visualization — it exists
 so that both humans and Claude Code can extend the suite without having to
@@ -34,6 +35,18 @@ verification/
   image_latent/           <- future-image-latent analysis
   attractor/               <- attractor-geometry battery (Themes A-G, DMD, steering, critical boundary)
   latent_dynamics/         <- delay-embedding / energy-field / dynamic-steering pipeline
+  intervention_v3/         <- steerability audit (PCA+SVM separability grid), value-guided
+                              best-of-N baseline, EDM-sampler noise-inversion positive control,
+                              observation-conditioned noise actor (SFT on inverted-noise
+                              targets), observer-based minimal-norm setpoint intervention
+                              (gripper + EE-height/EE-velocity variants, early-denoising-step
+                              sweep, real-vs-dummy-prompt zeta distribution check), Gaussian
+                              Monge-map distribution-transport steering (DiMaS-style, mean-shift
+                              vs full-transport ablation), multi-layer chunk-index-decayed
+                              minimal-norm control (WA-LQR-style scalar layer-chain LQR),
+                              paraphrase-robustness eval (verbatim vs semantically-equivalent
+                              prompt vs dummy prompt; T5 paraphrase embeddings are precomputed
+                              in a separate policy-free process to avoid OOM)
   sanity/                  <- T9/T10 sanity checks, G1 baseline-eval gate, run-manifest generator
   run_offline_analysis.sh  <- cross-suite orchestrator (representation + probing + mechanism)
   run_all_analysis_host.sh <- cross-suite orchestrator (Singularity host wrapper)

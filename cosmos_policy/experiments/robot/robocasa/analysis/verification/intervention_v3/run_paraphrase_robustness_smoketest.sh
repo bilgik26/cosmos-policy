@@ -1,0 +1,22 @@
+#!/bin/bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/common/env.sh"
+
+python3 -m cosmos_policy.experiments.robot.robocasa.analysis.verification.intervention_v3.precompute_paraphrase_embeddings \
+    --config cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference \
+    --ckpt_path nvidia/Cosmos-Policy-RoboCasa-Predict2-2B \
+    --config_file cosmos_policy/config/config.py \
+    --dataset_stats_path nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_dataset_statistics.json \
+    --t5_text_embeddings_path nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_t5_embeddings.pkl \
+    --task_name PnPCounterToCab --seed 195 --n_episodes 2 \
+    --out_path cosmos_policy/experiments/robot/robocasa/analysis/results/_smoketest_paraphrase_robustness/paraphrase_embeddings_PnPCounterToCab.pt
+
+python3 -m cosmos_policy.experiments.robot.robocasa.analysis.verification.intervention_v3.paraphrase_robustness \
+    --config cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference \
+    --ckpt_path nvidia/Cosmos-Policy-RoboCasa-Predict2-2B \
+    --config_file cosmos_policy/config/config.py \
+    --dataset_stats_path nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_dataset_statistics.json \
+    --t5_text_embeddings_path nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_t5_embeddings.pkl \
+    --embeddings_path cosmos_policy/experiments/robot/robocasa/analysis/results/_smoketest_paraphrase_robustness/paraphrase_embeddings_PnPCounterToCab.pt \
+    --out_dir cosmos_policy/experiments/robot/robocasa/analysis/results/_smoketest_paraphrase_robustness \
+    --task_name PnPCounterToCab --max_call 6 \
+    --conditions C0_real_verbatim C1_paraphrase C2_dummy

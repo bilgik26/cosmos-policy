@@ -353,14 +353,21 @@ def get_action_with_dynamic_hook(cfg, model, dataset_stats, obs, task_desc, hook
 
 def run_condition(cfg, model, dataset_stats, hook, capture, estimator, field, task_name,
                    condition_name, task_desc, use_steering, alpha, n_episodes, base_seed,
-                   max_call=40, frozen_obs=False):
+                   max_call=40, frozen_obs=False, adaptive_alpha_coef=None):
     """frozen_obs=True implements phase-4's "sensory feedback dependency" control (design.md
     フェーズ4指標3): the policy is always shown the FIRST call's observation, regardless of the
     real (still-physically-evolving) scene, while the environment still executes whatever
     actions that produces. If the resulting action trajectory collapses to something flat/
     repetitive relative to the frozen_obs=False condition (under the same steering config), that
     is evidence the dynamic-field-steered behaviour stays coupled to live sensory input rather
-    than degenerating into a fixed, Reactive-independent canned motion."""
+    than degenerating into a fixed, Reactive-independent canned motion.
+
+    adaptive_alpha_coef (M-3, review_report.md 査読対応): when set, overrides the constant
+    `alpha` with alpha_t = adaptive_alpha_coef * ||raw_dir_t|| for each call -- i.e. the
+    injection magnitude tracks the field's own raw magnitude ||v_field|| instead of a fixed
+    dose, restoring the "depth of the energy-field valley" information that unit-normalizing
+    v_field (as the constant-alpha conditions all do) discards. When None (default), behaviour
+    is byte-for-byte identical to the original constant-alpha implementation."""
     max_steps = TASK_MAX_STEPS.get(task_name, 500)
     ep_logs = []
     for ep in range(n_episodes):
@@ -415,9 +422,11 @@ def run_condition(cfg, model, dataset_stats, hook, capture, estimator, field, ta
                     if use_steering:
                         v_xp = field.query(D_t, Xp_t)
                         raw_dir = xp_direction_to_raw(v_xp, field.dyn_artifact)
-                        raw_dir_unit = raw_dir / (np.linalg.norm(raw_dir) + 1e-12)
+                        raw_dir_norm = float(np.linalg.norm(raw_dir))
+                        raw_dir_unit = raw_dir / (raw_dir_norm + 1e-12)
                         hook.vec = raw_dir_unit
-                        hook.alpha = alpha
+                        hook.alpha = (adaptive_alpha_coef * raw_dir_norm
+                                      if adaptive_alpha_coef is not None else alpha)
 
                 actions, had_nan = sanitize_actions(result["actions"])
                 nan_detected = nan_detected or had_nan
