@@ -1,7 +1,7 @@
 # Cosmos Policy 解析検証レポート
 
 **タスク**: PnPCounterToCab (RoboCasa)  
-**設計書**: `docs/analysis/revised_verification_design.md`  
+**設計書**: `docs/analysis/revised_init_eval/design.md`  
 **実行日**: 2026-07-01  
 **成功率**: 30/50 エピソード (60%)  
 **データ**: N=1108 policy calls, 50 episodes, 5 denoising steps (k=0..4), 7 probed layers

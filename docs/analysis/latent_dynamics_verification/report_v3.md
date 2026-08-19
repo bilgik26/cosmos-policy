@@ -2,7 +2,7 @@
 
 ## 0. 本レポートについて
 
-前回まで（`latent_dynamics_verification/report.md`・`report_v2.md`）の検証群は、Cosmos Policy の
+前回まで（`latent_dynamics_verification/report.md`・`latent_dynamics_verification/report_v2.md`）の検証群は、Cosmos Policy の
 潜在空間に対する活性介入（`Blk-13` の action-token 出力への固定方向ベクトル加算、動的フィールド
 steering）を一貫して検定し、ダミープロンプト条件下ではいずれの介入もタスク完遂を誘発できない
 （`success_rate` が 0.00 に張り付く）という否定的結果に繰り返し到達した。

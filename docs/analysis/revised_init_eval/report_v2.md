@@ -1,14 +1,14 @@
 # Cosmos Policy 機構解析 検証レポート v2 — レビュー指摘への対応
 
-**位置づけ**: 本ドキュメントは `verification_report.md`（第1回検証）に対する
-`review_verification_report.md`（レビュー）の指摘 7 項目に対応するため、
+**位置づけ**: 本ドキュメントは `report.md`（第1回検証）に対する
+`review_report.md`（レビュー）の指摘 7 項目に対応するため、
 新規の解析・追加のシミュレータ実行を行った結果をまとめたものである。
 第1回のレポートを上書きするのではなく、**何が確定し、何が訂正され、何が未解決か**
 を独立に追跡できるようにするために別ファイルとして作成した。
 
-**設計書**: `docs/analysis/revised_verification_design.md`
-**第1回結果**: `docs/analysis/verification_report.md`
-**レビュー**: `docs/analysis/review_verification_report.md`
+**設計書**: `docs/analysis/revised_init_eval/design.md`
+**第1回結果**: `docs/analysis/revised_init_eval/report.md`
+**レビュー**: `docs/analysis/revised_init_eval/review_report.md`
 **タスク**: PnPCounterToCab (RoboCasa), モデル: `nvidia/Cosmos-Policy-RoboCasa-Predict2-2B`
 **実行日**: 2026-07-06
 
@@ -38,7 +38,7 @@
 
 ## 1. レビュー指摘への対応状況サマリ
 
-`review_verification_report.md` §5「優先順位付きアクション」の 7 項目それぞれについて、
+`review_report.md` §5「優先順位付きアクション」の 7 項目それぞれについて、
 今回のセッションで実施した内容を示す。
 
 | # | レビュー指摘 | 対応 | 状態 |

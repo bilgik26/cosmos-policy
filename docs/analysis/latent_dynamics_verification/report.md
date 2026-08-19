@@ -18,7 +18,7 @@
 因果的否定的結果（言語なしでのベクトル場介入によるタスク駆動は不可能）は、追加のpositive control
 （オラクル介入）によってより強固に、かつ従来より深い形で確認された。
 
-先行2検証（`verification_report_v3.md`、`attractor_verification_report.md`）が確立した基盤——モデル・
+先行2検証（`revised_init_eval/report_v3.md`、`attractor_verification/report.md`）が確立した基盤——モデル・
 データ収集・プローブ層・統計手法・循環性回避の原則——をそのまま踏襲する。実装中に発見したバグは隠さず
 第9節にまとめ、結果は都合の良い部分だけを取り上げず正直に報告する。
 
@@ -369,7 +369,7 @@ CounterToCabの力学的不安定性シグナルが、D空間で顕在化する�
 
 ### 3.2 検証B-2：DMD力学解析のD空間再評価
 
-**目的**: 先行検証（`attractor_verification_report.md` §5.7）はDynamic Mode Decomposition (DMD)
+**目的**: 先行検証（`attractor_verification/report.md` §5.7）はDynamic Mode Decomposition (DMD)
 による窓化ヤコビアン近似（窓幅8、SVD階数打ち切り90%・上限4）で、`X_p`空間において「成功=自己安定化
 （`|λ_max|<1`）・失敗=不安定化（`|λ_max|>1`）」というパターンがタスク依存であること（TurnOnStoveでは
 支持、PnPCounterToCabでは反証）を発見していた。本検証はD空間で同じ解析を行い、この対応がより一貫した
